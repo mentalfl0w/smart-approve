@@ -1,7 +1,7 @@
 {
   "name": "smart-approve",
   "description": "High-risk-only approval hook with LLM risk analysis, behavior detection, protected-path interception, and decision memory for oh-my-pi (OMP) and pi-agent.",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "type": "module",
   "keywords": [
     "omp",
@@ -19,14 +19,18 @@
   ],
   "license": "MIT",
   "author": "",
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "dev": "bun run src/index.ts"
+  },
   "omp": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   }
 }
