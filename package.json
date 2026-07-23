@@ -1,7 +1,7 @@
 {
   "name": "smart-approve",
   "description": "High-risk-only approval hook with LLM risk analysis, behavior detection, protected-path interception, and decision memory for oh-my-pi (OMP) and pi-agent.",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "type": "module",
   "keywords": [
     "omp",

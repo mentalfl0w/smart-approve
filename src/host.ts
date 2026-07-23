@@ -24,10 +24,17 @@ function extractJson(text: string): RiskAnalysis | null {
 /**
  * Resolves the host binary path for one-shot model invocation.
  *
- * Uses process.argv[1] (the host binary that launched this extension) rather
- * than PATH lookup. This avoids the common failure where the extension
- * process inherits a sanitized PATH that doesn't contain omp/pi.
- * Resolves symlinks to get the real binary path.  Memoized.
+ * Strategy (in priority order):
+ *  1. process.execPath — the real runtime binary path (e.g.
+ *     /opt/homebrew/Cellar/omp/17.0.9/bin/omp).  Works even when the
+ *     host is a Bun-bundled single binary, where process.argv[1] is a
+ *     virtual FS path like /$bunfs/root/... that cannot be realpath'd.
+ *  2. process.argv[1] — the host binary that launched this extension.
+ *     Works for non-bundled hosts; realpath'd to resolve symlinks.
+ *  3. PATH lookup via `command -v omp` / `command -v pi` — last resort.
+ *     May fail if the extension process inherits a sanitized PATH.
+ *
+ * Memoized after first resolution.
  */
 export class HostResolver {
   private resolved: string | null | undefined;
@@ -37,24 +44,61 @@ export class HostResolver {
     this.logger = logger;
   }
 
-  /** Resolve and memoize the host binary realpath. */
+  /** Resolve and memoize the host binary path. */
   resolve(): string | null {
     if (this.resolved !== undefined) return this.resolved;
-    try {
-      const arg1 = process.argv[1];
-      if (!arg1) {
-        this.resolved = null;
-        this.logger.log("getHostBin: process.argv[1] is empty");
-        return null;
-      }
-      this.resolved = fs.realpathSync(arg1);
-      this.logger.log(`getHostBin: resolved ${this.resolved}`);
-      return this.resolved;
-    } catch (e) {
-      this.resolved = null;
-      this.logger.log(`getHostBin FAILED: ${e instanceof Error ? e.message : String(e)}`);
-      return null;
+
+    // 1. process.execPath — most reliable for bundled binaries
+    this.resolved = this.tryResolve("process.execPath", process.execPath);
+    if (this.resolved) return this.resolved;
+
+    // 2. process.argv[1] — for non-bundled hosts
+    this.resolved = this.tryResolve("process.argv[1]", process.argv[1]);
+    if (this.resolved) return this.resolved;
+
+    // 3. PATH lookup — last resort
+    this.resolved = this.tryPathLookup();
+    if (this.resolved) return this.resolved;
+
+    this.logger.log("getHostBin: all strategies failed");
+    this.resolved = null;
+    return null;
+  }
+
+  /** Try to realpath a candidate; log + return null on failure. */
+  private tryResolve(strategy: string, candidate: string | undefined): string | null {
+    if (!candidate) {
+      this.logger.log(`getHostBin: ${strategy} is empty`)
+      return null
     }
+    try {
+      const resolved = fs.realpathSync(candidate)
+      this.logger.log(`getHostBin: ${strategy} resolved ${resolved}`)
+      return resolved
+    } catch (e) {
+      this.logger.log(`getHostBin: ${strategy} FAILED: ${e instanceof Error ? e.message : String(e)}`)
+      return null
+    }
+  }
+
+  /** PATH lookup via `command -v omp` / `command -v pi`. */
+  private tryPathLookup(): string | null {
+    const { execSync } = require("child_process");
+    for (const bin of ["omp", "pi"]) {
+      try {
+        execSync(`command -v ${bin}`, {
+          stdio: ["pipe", "pipe", "ignore"],
+          timeout: 2000,
+          encoding: "utf-8",
+        })
+        this.logger.log(`getHostBin: PATH lookup resolved ${bin}`)
+        return bin
+      } catch {
+        // not found
+      }
+    }
+    this.logger.log("getHostBin: PATH lookup failed for omp and pi");
+    return null;
   }
 }
 
