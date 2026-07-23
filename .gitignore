@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.js
+*.js.map
+*.d.ts
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
