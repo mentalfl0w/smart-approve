@@ -3,9 +3,8 @@
  *
  * Writes timestamped lines to a dedicated log file
  * (~/.omp/logs/smart-approve.log) so diagnosis does not depend on whether
- * the host captures extension stderr.  Also mirrors to console.error for
- * hosts that do capture it.  All other modules route diagnostics through
- * this single sink.
+ * the host captures extension stderr.  All other modules route diagnostics
+ * through this single sink.
  */
 
 import * as fs from "node:fs";
@@ -53,7 +52,5 @@ export class Logger {
     } catch {
       // ignore
     }
-    // Mirror to stderr for hosts that capture it.
-    console.error(`[smart-approve] ${message}`);
   }
 }
