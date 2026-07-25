@@ -105,10 +105,9 @@ export class HostResolver {
 /**
  * Runs one-shot model invocations via the host binary's print mode.
  *
- * Timeout is 20s — well below OMP's EXTENSION_HANDLER_TIMEOUT_MS (30s
- * hardcoded).  8s was too tight: cold subprocess spawn + model latency
- * regularly exceeded it, causing silent failure. 20s leaves enough window
- * for the fallback rule-only dialog to render on timeout.
+ * The model spec and timeout come from SmartApproveConfig (model + llmTimeoutMs),
+ * defaulting to @smol / 12s. 12s leaves ~18s of headroom under OMP's
+ * EXTENSION_HANDLER_TIMEOUT_MS (30s hardcoded) for the confirmation dialog.
  */
 export class ModelInvoker {
   private readonly host: HostResolver;
@@ -119,16 +118,17 @@ export class ModelInvoker {
     this.logger = logger;
   }
 
-  /** Run the smol model on a prompt, parse JSON, return the analysis. */
+  /** Run the configured model on a prompt, parse JSON, return the analysis. */
   async invoke(
     pi: ExtensionAPI,
     prompt: string,
-    timeoutMs = 20_000,
+    model: string,
+    timeoutMs: number,
   ): Promise<RiskAnalysis | null> {
     const bin = this.host.resolve();
     if (!bin) return null;
 
-    this.logger.log(`runOneShotModel: calling ${bin} -p --model @smol ...`);
+    this.logger.log(`runOneShotModel: calling ${bin} -p --model ${model} ...`);
     try {
       const result = await pi.exec(bin, [
         "-p",
@@ -139,7 +139,7 @@ export class ModelInvoker {
         "--no-skills",
         "--no-rules",
         "--no-title",
-        "--model", "@smol",
+        "--model", model,
         prompt,
       ], { timeout: timeoutMs });
 
@@ -171,6 +171,8 @@ export class ModelInvoker {
     behaviorLabels: string[],
     contextSection: string,
     t: I18n,
+    model: string,
+    timeoutMs: number,
   ): Promise<RiskAnalysis | null> {
     const behaviorText = behaviorLabels.length > 0
       ? behaviorLabels.join("; ")
@@ -196,7 +198,7 @@ export class ModelInvoker {
       t.promptOnlyJson,
     ].join("\n");
 
-    return this.invoke(pi, prompt);
+    return this.invoke(pi, prompt, model, timeoutMs);
   }
 
 }

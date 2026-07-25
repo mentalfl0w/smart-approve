@@ -18,6 +18,9 @@ export interface I18nLang {
   filePath: string;
   allowPrompt: string;
   analysisUnavailable: string;
+  /** Shown via ui.notify when the LLM result arrives AFTER the dialog was
+   *  already shown with rule-based labels (late arrival). */
+  analysisLate: (risk: string, summary: string) => string;
   blockedNoUI: (label: string) => string;
   blockedPathNoUI: (p: string) => string;
   userDenied: (label: string) => string;
@@ -51,8 +54,9 @@ const I18N: Record<Lang, I18nLang> = {
     recommend: "建议",
     command: "命令",
     filePath: "文件",
-    allowPrompt: "是否允许执行？",
     analysisUnavailable: "（模型分析不可用）",
+    analysisLate: (risk, summary) => `[smart-approve] 模型分析（迟到）: 风险=${risk} — ${summary}`,
+    allowPrompt: "是否允许执行？",
     blockedNoUI: (label) => `[smart-approve] 高危命令被拦截（无 UI 无法确认）: ${label}`,
     blockedPathNoUI: (p) => `[smart-approve] 敏感路径写入被拦截（无 UI 无法确认）: ${p}`,
     userDenied: (label) => `[smart-approve] 用户拒绝: ${label}`,
@@ -81,8 +85,9 @@ const I18N: Record<Lang, I18nLang> = {
     recommend: "Recommendation",
     command: "Command",
     filePath: "File",
-    allowPrompt: "Allow execution?",
     analysisUnavailable: "(model analysis unavailable)",
+    analysisLate: (risk, summary) => `[smart-approve] Model analysis (late): risk=${risk} — ${summary}`,
+    allowPrompt: "Allow execution?",
     blockedNoUI: (label) => `[smart-approve] Dangerous command blocked (no UI to confirm): ${label}`,
     blockedPathNoUI: (p) => `[smart-approve] Protected path write blocked (no UI to confirm): ${p}`,
     userDenied: (label) => `[smart-approve] User denied: ${label}`,

@@ -89,6 +89,37 @@ class SmartApprove {
     });
   }
 
+  /**
+   * Best-effort late-arrival notifier.  When the LLM race loses (model slower
+   * than llmRaceMs), the dialog is shown immediately with rule-based labels;
+   * this attaches a continuation that surfaces the model result via ui.notify
+   * whenever it eventually resolves.
+   *
+   * Runs as a detached promise — the callback body is wrapped in try/catch
+   * because OMP treats unhandled throws in detached callbacks as fatal
+   * (session teardown).  ctx validity after handler return is undocumented,
+   * so every ctx touch is guarded.
+   */
+  private scheduleLateNotify(
+    ctx: ExtensionCtx,
+    llmPromise: Promise<{ risk?: string; summary?: string } | null>,
+    t: { analysisLate: (risk: string, summary: string) => string },
+  ): void {
+    llmPromise
+      .then((late) => {
+        try {
+          if (late) {
+            const risk = late.risk ?? "?";
+            const summary = late.summary ?? "";
+            ctx.ui.notify?.(t.analysisLate(risk, summary), "info");
+          }
+        } catch {
+          // ctx may be stale after handler return; swallow — decorative-only.
+        }
+      })
+      .catch(() => void 0);
+  }
+
   // ── bash interception ──────────────────────────────────────────────
 
   private async handleBash(
@@ -124,10 +155,25 @@ class SmartApprove {
       const contextSection = this.contextGatherer.format(sessionCtx, t);
       const behaviorLabels = analysis.labels.map((l) => l[this.lang] || l.en);
       this.logger.log(`analyzeRisk: cmd="${cmd.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`);
-      const llmResult = await this.modelInvoker.analyze(this.pi, cmd, behaviorLabels, contextSection, t);
-      analysisText = formatAnalysis(llmResult, t);
-      this.logger.log(`analyzeRisk: analysisText=${analysisText ? "OK" : "null"}`);
+
+      // Race: start the LLM, but show the dialog immediately if it doesn't
+      // return within llmRaceMs. Late-arriving results are surfaced via
+      // ui.notify so the user is never blocked waiting for the model.
+      const llmPromise = this.modelInvoker
+        .analyze(this.pi, cmd, behaviorLabels, contextSection, t, config.model, config.llmTimeoutMs)
+        .catch(() => null);
+      const raceResult = await Promise.race([
+        llmPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), config.llmRaceMs)),
+      ]);
+      analysisText = formatAnalysis(raceResult, t);
+      this.logger.log(`analyzeRisk: analysisText=${analysisText ? "OK" : "null (will notify if late)"}`);
       ctx.ui.setStatus("smart-approve", "");
+
+      // If the race lost, surface the LLM result via notify when it arrives.
+      if (!analysisText) {
+        this.scheduleLateNotify(ctx, llmPromise, t);
+      }
     }
 
     const title = t.confirmTitle(label);
@@ -195,9 +241,19 @@ class SmartApprove {
       ].join("\n");
 
       this.logger.log(`analyzeRisk(write): tool=${event.toolName} path=${filePath}`);
-      const llmResult = await this.modelInvoker.invoke(this.pi, filePrompt);
-      analysisText = formatAnalysis(llmResult, t);
+      const llmPromise = this.modelInvoker
+        .invoke(this.pi, filePrompt, config.model, config.llmTimeoutMs)
+        .catch(() => null);
+      const raceResult = await Promise.race([
+        llmPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), config.llmRaceMs)),
+      ]);
+      analysisText = formatAnalysis(raceResult, t);
       ctx.ui.setStatus("smart-approve", "");
+
+      if (!analysisText) {
+        this.scheduleLateNotify(ctx, llmPromise, t);
+      }
     }
 
     const title = t.confirmPathTitle(filePath);
