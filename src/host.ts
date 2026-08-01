@@ -7,7 +7,7 @@
  */
 
 import * as fs from "node:fs";
-import type { ExtensionAPI, RiskAnalysis } from "./types";
+import type { ExtensionAPI, ExecResult, RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
 
@@ -105,9 +105,10 @@ export class HostResolver {
 /**
  * Runs one-shot model invocations via the host binary's print mode.
  *
- * The model spec and timeout come from SmartApproveConfig (model + llmTimeoutMs),
- * defaulting to @smol / 12s. 12s leaves ~18s of headroom under OMP's
- * EXTENSION_HANDLER_TIMEOUT_MS (30s hardcoded) for the confirmation dialog.
+ * The model spec comes from SmartApproveConfig (defaulting to @smol).
+ * No timeout is applied — the subprocess runs to completion. In the
+ * custom tool's execute() path there is no 30s pressure. If @smol is
+ * unconfigured, falls back to @default automatically.
  */
 export class ModelInvoker {
   private readonly host: HostResolver;
@@ -123,14 +124,13 @@ export class ModelInvoker {
     pi: ExtensionAPI,
     prompt: string,
     model: string,
-    timeoutMs: number,
   ): Promise<RiskAnalysis | null> {
     const bin = this.host.resolve();
     if (!bin) return null;
 
-    this.logger.log(`runOneShotModel: calling ${bin} -p --model ${model} ...`);
-    try {
-      const result = await pi.exec(bin, [
+    const run = (m: string): Promise<ExecResult> => {
+      this.logger.log(`runOneShotModel: calling ${bin} -p --model ${m} ...`);
+      return pi.exec(bin, [
         "-p",
         "--no-tools",
         "--no-session",
@@ -139,9 +139,18 @@ export class ModelInvoker {
         "--no-skills",
         "--no-rules",
         "--no-title",
-        "--model", model,
+        "--model", m,
         prompt,
-      ], { timeout: timeoutMs });
+      ]);
+    };
+
+    try {
+      let result = await run(model);
+      // Fallback: if @smol role is unconfigured, retry with @default
+      if (result.code !== 0 && model === "@smol") {
+        this.logger.log(`runOneShotModel: @smol failed (exit ${result.code}), retrying with @default`);
+        result = await run("@default");
+      }
 
       if (result.code !== 0) {
         this.logger.log(`runOneShotModel: exit code ${result.code}, stderr: ${(result.stderr || "").slice(0, 200)}`);
@@ -172,7 +181,6 @@ export class ModelInvoker {
     contextSection: string,
     t: I18n,
     model: string,
-    timeoutMs: number,
   ): Promise<RiskAnalysis | null> {
     const behaviorText = behaviorLabels.length > 0
       ? behaviorLabels.join("; ")
@@ -198,7 +206,7 @@ export class ModelInvoker {
       t.promptOnlyJson,
     ].join("\n");
 
-    return this.invoke(pi, prompt, model, timeoutMs);
+    return this.invoke(pi, prompt, model);
   }
 
 }

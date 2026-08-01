@@ -1,46 +1,48 @@
 /**
- * Smart Approve — hook entry point.
+ * Smart Approve — extension entry point.
  *
- * Intercepts dangerous bash commands AND write/edit to sensitive paths.
- * Uses behavior-based detection (not just regex) and feeds session context
- * to the LLM reviewer. Remembers decisions (session + permanent).
+ * Registers a custom "bash" tool that replaces OMP's built-in bash,
+ * moving dangerous-command approval into execute() which is NOT subject
+ * to EXTENSION_HANDLER_TIMEOUT_MS (30s). This removes all time pressure
+ * from LLM risk analysis and the approval dialog.
  *
- * Setup: tools.approvalMode: yolo (auto-approve all) + this hook intercepts
- * dangerous commands. Safe commands pass through with zero interruption.
- * When a dangerous pattern/behavior matches, the hook invokes the smol model
- * via the host's one-shot print mode (`omp -p` or `pi -p`) to analyze the
- * command with full session context, then shows a confirmation dialog.
+ * Also intercepts write/edit to protected paths via the tool_call hook
+ * (the 30s budget is sufficient for path matching + confirmation dialog).
  *
- * Output language adapts to the user's locale (zh / en).
+ * Setup:
+ *   config.yml: bash.enabled: false  (removes built-in bash tool)
+ *   config.yml: tools.approvalMode: yolo
+ *   smart-approve.json: llmAnalysis, model, ...
  *
  * Configuration: ~/.omp/agent/smart-approve.json (or ~/.pi/agent/... on pi)
  * Allow-list:     ~/.omp/agent/smart-approve-allow.json
  *
  * Module layout:
- *   types.ts    — shared interfaces
- *   logger.ts   — Logger (file + stderr)
- *   i18n.ts     — locale detection + bilingual strings
+ *   types.ts     — shared interfaces (ExtensionAPI, ToolDefinition, etc.)
+ *   logger.ts    — Logger (file + stderr)
+ *   i18n.ts      — locale detection + bilingual strings
  *   behaviors.ts — behavior catalog, git parser, composite analysis
- *   paths.ts    — ProtectedPathMatcher
- *   config.ts   — ConfigStore
+ *   paths.ts     — ProtectedPathMatcher
+ *   config.ts    — ConfigStore
  *   allowlist.ts — AllowList
- *   context.ts  — SessionContextGatherer
- *   host.ts     — HostResolver + ModelInvoker
- *   dialog.ts   — confirmWithRemember + formatAnalysis
- *   index.ts    — SmartApprove orchestrator (this file)
+ *   context.ts   — SessionContextGatherer
+ *   host.ts      — HostResolver + ModelInvoker
+ *   dialog.ts    — confirmWithRemember + formatAnalysis
+ *   bash-tool.ts — custom "bash" tool (replaces built-in)
+ *   index.ts     — SmartApprove orchestrator (this file)
  */
 
 import type { ExtensionAPI, ExtensionCtx, ToolCallEvent } from "./types";
 import { Logger } from "./logger";
 import { detectLang, getI18n } from "./i18n";
 import type { Lang } from "./i18n";
-import { analyzeCommand } from "./behaviors";
 import { ProtectedPathMatcher } from "./paths";
 import { ConfigStore } from "./config";
 import { AllowList } from "./allowlist";
 import { SessionContextGatherer } from "./context";
 import { HostResolver, ModelInvoker } from "./host";
-import { confirmWithRemember, formatAnalysis } from "./dialog";
+import { confirmWithRemember } from "./dialog";
+import { registerBashTool } from "./bash-tool";
 
 /**
  * Smart Approve extension orchestrator.
@@ -71,14 +73,26 @@ class SmartApprove {
     this.modelInvoker = new ModelInvoker(host, this.logger);
   }
 
-  /** Register the tool_call hook.  No-op if the extension is disabled. */
+  /** Register the custom bash tool + write/edit hook. No-op if disabled. */
   register(): void {
     if (!this.configStore.config.enabled) return;
 
+    // Register the custom "bash" tool (replaces built-in bash).
+    // execute() is NOT subject to EXTENSION_HANDLER_TIMEOUT_MS (30s),
+    // so LLM analysis and the approval dialog have no time pressure.
+    registerBashTool(this.pi, {
+      config: this.configStore.config,
+      allowList: this.allowList,
+      contextGatherer: this.contextGatherer,
+      modelInvoker: this.modelInvoker,
+      logger: this.logger,
+      lang: this.lang,
+      t: this.t,
+    });
+
+    // Intercept write/edit on protected paths (30s budget is sufficient
+    // for path matching + confirmation dialog).
     this.pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionCtx) => {
-      if (event.toolName === "bash") {
-        return this.handleBash(event, ctx);
-      }
       if (event.toolName === "write" || event.toolName === "edit") {
         return this.handleWrite(event, ctx);
       }
@@ -89,109 +103,6 @@ class SmartApprove {
     });
   }
 
-  /**
-   * Best-effort late-arrival notifier.  When the LLM race loses (model slower
-   * than llmRaceMs), the dialog is shown immediately with rule-based labels;
-   * this attaches a continuation that surfaces the model result via ui.notify
-   * whenever it eventually resolves.
-   *
-   * Runs as a detached promise — the callback body is wrapped in try/catch
-   * because OMP treats unhandled throws in detached callbacks as fatal
-   * (session teardown).  ctx validity after handler return is undocumented,
-   * so every ctx touch is guarded.
-   */
-  private scheduleLateNotify(
-    ctx: ExtensionCtx,
-    llmPromise: Promise<{ risk?: string; summary?: string } | null>,
-    t: { analysisLate: (risk: string, summary: string) => string },
-  ): void {
-    llmPromise
-      .then((late) => {
-        try {
-          if (late) {
-            const risk = late.risk ?? "?";
-            const summary = late.summary ?? "";
-            ctx.ui.notify?.(t.analysisLate(risk, summary), "info");
-          }
-        } catch {
-          // ctx may be stale after handler return; swallow — decorative-only.
-        }
-      })
-      .catch(() => void 0);
-  }
-
-  // ── bash interception ──────────────────────────────────────────────
-
-  private async handleBash(
-    event: ToolCallEvent,
-    ctx: ExtensionCtx,
-  ): Promise<void | { block: true; reason: string }> {
-    const cmd = event.input?.command ?? "";
-    if (!cmd.trim()) return;
-    const cwd = ctx.cwd || process.cwd();
-    const config = this.configStore.config;
-    const t = this.t;
-
-    if (config.rememberDecisions && this.allowList.isAllowed("bash", cmd, cwd)) {
-      return; // remembered allow — pass through
-    }
-
-    const analysis = analyzeCommand(cmd);
-    if (analysis.behaviors.length === 0) return; // safe command, pass through
-
-    const label = analysis.labels[0]?.[this.lang] || analysis.labels[0]?.en || "danger";
-
-    if (analysis.hardBlocked) {
-      return { block: true, reason: t.blockedNoUI(label) + "\n" + t.command + ": " + cmd };
-    }
-    if (!ctx.hasUI) {
-      return { block: true, reason: t.blockedNoUI(label) + "\n" + t.command + ": " + cmd };
-    }
-
-    let analysisText: string | null = null;
-    if (config.llmAnalysis) {
-      ctx.ui.setStatus("smart-approve", t.analyzing);
-      const sessionCtx = this.contextGatherer.gather(ctx, config.contextMaxChars);
-      const contextSection = this.contextGatherer.format(sessionCtx, t);
-      const behaviorLabels = analysis.labels.map((l) => l[this.lang] || l.en);
-      this.logger.log(`analyzeRisk: cmd="${cmd.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`);
-
-      // Race: start the LLM, but show the dialog immediately if it doesn't
-      // return within llmRaceMs. Late-arriving results are surfaced via
-      // ui.notify so the user is never blocked waiting for the model.
-      const llmPromise = this.modelInvoker
-        .analyze(this.pi, cmd, behaviorLabels, contextSection, t, config.model, config.llmTimeoutMs)
-        .catch(() => null);
-      const raceResult = await Promise.race([
-        llmPromise,
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), config.llmRaceMs)),
-      ]);
-      analysisText = formatAnalysis(raceResult, t);
-      this.logger.log(`analyzeRisk: analysisText=${analysisText ? "OK" : "null (will notify if late)"}`);
-      ctx.ui.setStatus("smart-approve", "");
-
-      // If the race lost, surface the LLM result via notify when it arrives.
-      if (!analysisText) {
-        this.scheduleLateNotify(ctx, llmPromise, t);
-      }
-    }
-
-    const title = t.confirmTitle(label);
-    const body = analysisText
-      ? `${analysisText}\n\n────────\n${t.command}: ${cmd}\n\n${t.allowPrompt}`
-      : `${t.analysisUnavailable}\n\n${t.command}: ${cmd}\n\n${t.allowPrompt}`;
-
-    const decision = await confirmWithRemember(ctx, title, body, t, config.rememberDecisions);
-    if (!decision.ok) {
-      return { block: true, reason: t.userDenied(label) };
-    }
-
-    if (decision.remember === "session") {
-      this.allowList.rememberSession("bash", cmd, cwd);
-    } else if (decision.remember === "permanent") {
-      this.allowList.rememberPermanent("bash", cmd, cwd);
-    }
-  }
 
   // ── write/edit interception on protected paths ────────────────────
 
@@ -216,50 +127,8 @@ class SmartApprove {
       return { block: true, reason: t.blockedPathNoUI(filePath) };
     }
 
-    let analysisText: string | null = null;
-    if (config.llmAnalysis) {
-      ctx.ui.setStatus("smart-approve", t.analyzing);
-      const sessionCtx = this.contextGatherer.gather(ctx, config.contextMaxChars);
-      const filePrompt = [
-        t.promptIntro,
-        "",
-        `=== ${t.promptContext} ===`,
-        this.contextGatherer.format(sessionCtx, t),
-        `=== ${t.promptRule} ===`,
-        `${event.toolName} on protected path: ${filePath}`,
-        "",
-        `=== ${t.promptCommand} ===`,
-        `${event.toolName} ${filePath}`,
-        "",
-        t.promptOutput,
-        '- risk: "low" | "medium" | "high"',
-        `- summary: ${t.promptSummaryDesc}`,
-        `- detail: ${t.promptDetailDesc}`,
-        `- recommend: ${t.promptRecommendDesc}`,
-        "",
-        t.promptOnlyJson,
-      ].join("\n");
-
-      this.logger.log(`analyzeRisk(write): tool=${event.toolName} path=${filePath}`);
-      const llmPromise = this.modelInvoker
-        .invoke(this.pi, filePrompt, config.model, config.llmTimeoutMs)
-        .catch(() => null);
-      const raceResult = await Promise.race([
-        llmPromise,
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), config.llmRaceMs)),
-      ]);
-      analysisText = formatAnalysis(raceResult, t);
-      ctx.ui.setStatus("smart-approve", "");
-
-      if (!analysisText) {
-        this.scheduleLateNotify(ctx, llmPromise, t);
-      }
-    }
-
     const title = t.confirmPathTitle(filePath);
-    const body = analysisText
-      ? `${analysisText}\n\n────────\n${t.filePath}: ${filePath}\n\n${t.allowPrompt}`
-      : `${t.analysisUnavailable}\n\n${t.filePath}: ${filePath}\n\n${t.allowPrompt}`;
+    const body = `${t.filePath}: ${filePath}\n\n${t.allowPrompt}`;
 
     const decision = await confirmWithRemember(ctx, title, body, t, config.rememberDecisions);
     if (!decision.ok) {

@@ -18,11 +18,55 @@ export interface ExtensionAPI {
       ctx: ExtensionCtx,
     ) => Promise<void | { block: true; reason: string }>,
   ): void;
-  exec(
-    bin: string,
-    args: string[],
-    opts?: Record<string, unknown>,
-  ): Promise<{ code: number; stdout: string; stderr: string }>;
+  /** Execute a shell command. */
+  exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
+  /** Register a custom tool callable by the LLM. */
+  registerTool<TParams = unknown, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;
+  /** Injected zod module for tool parameter schemas (runtime-injected by host). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  zod: any;
+}
+
+/** Minimal exec options (subset of Node/Bun exec). */
+export interface ExecOptions {
+  cwd?: string;
+  env?: Record<string, string>;
+  timeout?: number;
+  signal?: AbortSignal;
+}
+
+/** Minimal exec result. */
+export interface ExecResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  killed?: boolean;
+}
+
+/** Tool definition for registerTool. */
+export interface ToolDefinition<TParams = unknown, TDetails = unknown> {
+  name: string;
+  label?: string;
+  description: string;
+  parameters: unknown;
+  approval?: string;
+  deferrable?: boolean;
+  hidden?: boolean;
+  execute(
+    toolCallId: string,
+    params: TParams,
+    signal: AbortSignal | undefined,
+    onUpdate: ((update: { content: unknown[]; details?: unknown }) => void) | undefined,
+    ctx: ExtensionCtx,
+  ): Promise<AgentToolResult<TDetails>>;
+  onSession?: (event: { reason: string }, ctx: ExtensionCtx) => void | Promise<void>;
+}
+
+/** Tool result returned by custom tool execute(). */
+export interface AgentToolResult<TDetails = unknown> {
+  content: Array<{ type: "text"; text: string }>;
+  details?: TDetails;
+  isError?: boolean;
 }
 
 export interface ToolCallEvent {

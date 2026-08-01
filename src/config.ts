@@ -27,14 +27,6 @@ export interface SmartApproveConfig {
    *  or bare id. Default @smol — the fast online role, returns within the
    *  3s race window more often than @tiny (local ONNX, ~20s). */
   model: string;
-  /** Hard timeout for the one-shot LLM subprocess (ms). Default 12s — leaves
-   *  budget for user confirmation within OMP's 30s hook wall-clock. */
-  llmTimeoutMs: number;
-  /** Race window for best-effort LLM enrichment before showing the dialog (ms).
-   *  If the LLM returns within this window, the analysis is embedded in the
-   *  dialog body; otherwise the dialog shows rule-based labels immediately
-   *  and the LLM result (if it arrives later) is surfaced via ui.notify. */
-  llmRaceMs: number;
 }
 
 const DEFAULT_CONFIG: SmartApproveConfig = {
@@ -44,8 +36,6 @@ const DEFAULT_CONFIG: SmartApproveConfig = {
   rememberDecisions: true,
   contextMaxChars: 3000,
   model: "@smol",
-  llmTimeoutMs: 12_000,
-  llmRaceMs: 3_000,
 };
 
 /** Deep-merge user config over defaults (arrays replaced, not concatenated). */
@@ -59,8 +49,6 @@ function mergeConfig(user: unknown): SmartApproveConfig {
     rememberDecisions: typeof u.rememberDecisions === "boolean" ? u.rememberDecisions : DEFAULT_CONFIG.rememberDecisions,
     contextMaxChars: typeof u.contextMaxChars === "number" ? u.contextMaxChars : DEFAULT_CONFIG.contextMaxChars,
     model: typeof u.model === "string" && u.model.trim() ? u.model.trim() : DEFAULT_CONFIG.model,
-    llmTimeoutMs: typeof u.llmTimeoutMs === "number" ? u.llmTimeoutMs : DEFAULT_CONFIG.llmTimeoutMs,
-    llmRaceMs: typeof u.llmRaceMs === "number" ? u.llmRaceMs : DEFAULT_CONFIG.llmRaceMs,
   };
 }
 
