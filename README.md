@@ -1,38 +1,47 @@
 # smart-approve
 
-A high-risk-only approval hook with LLM risk analysis, behavior detection, protected-path interception, and decision memory. Compatible with both **oh-my-pi (OMP)** and upstream **pi-agent**.
+A custom "bash" tool that replaces OMP's built-in bash, with LLM-powered risk analysis, behavior detection, protected-path interception, and decision memory. Compatible with both **oh-my-pi (OMP)** and upstream **pi-agent**.
 
-Safe commands pass through with **zero interruption**. When a dangerous behavior is detected or a protected path is hit, the hook invokes the `smol` model — with full session context — to produce a structured risk assessment, then shows a three-way confirmation dialog. In headless (subagent) contexts, dangerous operations are blocked outright.
+Safe commands pass through with **zero interruption**. When a dangerous behavior is detected, the custom tool's `execute()` method runs LLM risk analysis and shows an approval dialog — all outside OMP's 30-second `EXTENSION_HANDLER_TIMEOUT_MS`, so there is no time pressure. In headless (subagent) contexts, dangerous operations are blocked outright.
 
 ## How it works
 
 ```
-LLM calls bash / write / edit
+LLM calls bash tool
        │
-   allow-list hit (session or permanent)? ── yes → pass through
+   allow-list hit (session or permanent)? ── yes → execute
        │ no
-   ├─ bash: analyzeCommand() — argument parsing + regex secondary net
-   │   ├─ no behaviors → pass through
-   │   ├─ hard-block behavior (rm -rf /, fork bomb, curl|sh…) → block always
-   │   └─ dangerous behavior → needs review ↓
-   │
-   ├─ write/edit: isProtectedPath() — glob + symlink-aware
-   │   ├─ not protected → pass through
-   │   └─ protected → needs review ↓
-   │
-   ├─ ctx.hasUI === false (headless subagent) → block
-       │
-       └─ has UI:
-          setStatus("analyzing…")
-          gatherSessionContext() — original user task + recent agent plan
-          detectHost(): omp → pi → null;  <host> -p --model @smol (≤8s, capped below the handler's 30s budget)
-              success → dialog shows risk / summary / detail / recommendation
-              failure → degrades to rule-only confirmation
-          ctx.ui.select(title, [session allow, permanent allow, deny])
-              session   → in-memory Set (cleared on restart)
-              permanent → persisted to JSON file
-              deny      → block
+   analyzeCommand() — argument parsing + regex secondary net
+       ├─ no behaviors → execute (zero interruption)
+       ├─ hard-block (rm -rf /, fork bomb, curl|sh…) → block always
+       └─ dangerous behavior → needs review ↓
+              │
+          ctx.hasUI === false (headless) → block
+              │ has UI:
+              setStatus("analyzing…")
+              gatherSessionContext() — original user task + recent agent plan
+              omp -p --model @smol (no timeout, runs to completion)
+                  @smol unconfigured? → retry with @default
+                  success → dialog shows risk / summary / detail / recommendation
+                  failure → dialog shows rule-based label only
+              ctx.ui.select(title, [session allow, permanent allow, deny])
+                  session   → in-memory Set (cleared on restart)
+                  permanent → persisted to JSON file
+                  deny      → block
+              approved → pi.exec("bash", ["-c", cmd]) → return output to LLM
 ```
+
+**write/edit to protected paths** is handled separately via the `tool_call` hook — pure path matching + confirmation dialog, no LLM analysis (the path itself is sufficient signal).
+
+## Architecture: custom tool, not handler interception
+
+OMP's `EXTENSION_HANDLER_TIMEOUT_MS` (30s, hardcoded) wraps `tool_call` event handler dispatch — but **not** custom tool `execute()` methods. This extension exploits that:
+
+1. `config.yml: bash.enabled: false` — removes OMP's built-in bash tool
+2. `pi.registerTool({ name: "bash", ... })` — registers a replacement with the same name
+3. All approval logic (behavior detection → LLM analysis → `ui.select` → execution) lives inside `execute()`, free from the 30s timeout
+
+The previous architecture intercepted bash via `pi.on("tool_call")` and was killed by the 30s timeout during LLM analysis. The custom tool architecture eliminates this entirely.
 
 ## Features
 
@@ -52,7 +61,7 @@ Regex rules remain as a secondary net covering 30+ patterns: `rm -rf`, fork bomb
 
 ### 2. Protected path interception (write/edit)
 
-Intercepts `write`/`edit` tool calls and matches the target path against glob patterns:
+Intercepts `write`/`edit` tool calls via the `tool_call` hook and matches the target path against glob patterns:
 
 - `.env`, `.env.*` (`.env.example` explicitly allowed)
 - `**/.ssh/**`, `**/.kube/config`, `**/.aws/credentials`
@@ -61,6 +70,8 @@ Intercepts `write`/`edit` tool calls and matches the target path against glob pa
 - `**/auth.json`, `**/.config/gh/hosts.yml`, `**/.config/gcloud/**`
 
 Matching is **symlink-aware**: resolves `realpath` before matching, so a symlink alias can't evade a deny.
+
+Path matching is pure and fast — no LLM analysis needed. The 30s handler budget is more than sufficient for path matching + confirmation dialog.
 
 ### 3. Decision memory
 
@@ -74,32 +85,16 @@ The confirmation dialog offers three choices:
 
 Keys are scoped to `tool + normalized-content + cwd`, so the same command in a different project still triggers review. When the UI doesn't support `select`, it degrades to a simple `confirm` (two-way).
 
-### 4. Persistent configuration with defaults
+### 4. LLM risk analysis (no timeout)
 
-Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve.json` on pi-agent). All fields are optional — defaults apply when missing:
+The custom bash tool's `execute()` invokes the `@smol` model via the host binary's print mode (`omp -p --no-tools --no-session ...`). If `@smol` is unconfigured or fails, it automatically retries with `@default`. The subprocess runs to completion — no timeout is applied.
 
-```json
-{
-  "enabled": true,
-  "protectedPaths": [
-    ".env", ".env.*", "!.env.example",
-    "**/.ssh/**", "**/.kube/config", "**/.aws/credentials",
-    "**/*.pem", "**/*.key", "**/*.p12", "**/*.kdbx",
-    "**/id_rsa", "**/id_ed25519", "**/auth.json"
-  ],
-  "llmAnalysis": true,
-  "rememberDecisions": true,
-  "contextMaxChars": 3000
-}
-```
+The LLM receives:
+- **Session context** — original user task + recent agent plan (injection-guarded)
+- **Detected behaviors** — localized labels
+- **The command** — as-is
 
-| Field | Default | Description |
-|---|---|---|
-| `enabled` | `true` | Master switch |
-| `protectedPaths` | 20+ built-in patterns | Glob patterns for write/edit interception; `!` prefix negates |
-| `llmAnalysis` | `true` | Whether to invoke the `smol` model for risk analysis; `false` = rule-only confirmation |
-| `rememberDecisions` | `true` | Whether to offer session/permanent remember options in the dialog |
-| `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
+And returns structured JSON: `risk` (low/medium/high), `summary`, `detail`, `recommend`.
 
 ### 5. Session context for LLM review
 
@@ -122,62 +117,81 @@ The following behaviors are **always hard-blocked** — no LLM review, no dialog
 - Disk format (`mkfs`, `dd` to block device)
 - Shutdown / reboot
 
-### 7. OMP + pi dual compatibility with graceful degradation
+### 7. Non-interactive command execution
+
+Commands are executed via `pi.exec("bash", ["-c", cmd])` with a hardened non-interactive environment:
+
+- `PAGER=cat`, `GIT_PAGER=cat`, `LESS=FRX` — no pager hangs
+- `GIT_TERMINAL_PROMPT=0`, `SSH_ASKPASS=/usr/bin/false` — no credential prompts
+- `EDITOR=true`, `VISUAL=true` — no editor launches
+- `TERM=dumb`, `NO_COLOR=1`, `CI=1` — clean output
+- Inherits `process.env` (including `PATH`) so all binaries are accessible
+
+Output is truncated (20KB head + 50KB tail with elision marker) to match OMP's built-in bash tool behavior.
+
+### 8. OMP + pi dual compatibility with graceful degradation
 
 | Aspect | Implementation |
 |---|---|
 | Dual manifest | `package.json` declares both `omp.extensions` and `pi.extensions` |
-| Host detection | `detectHost()` probes PATH for `omp` → `pi`, cached per process |
+| Host detection | `process.execPath` → `process.argv[1]` → PATH lookup (`omp` → `pi`) |
 | LLM invocation | `omp -p` or `pi -p`, flags shared by both |
-| Fallback chain | `omp` fails → `pi` fails → rule-only confirmation (no LLM) |
+| Model fallback | `@smol` fails → retry `@default` → rule-only confirmation (no LLM) |
 | Headless | `ctx.hasUI === false` blocks all dangerous operations immediately |
 | Bilingual | zh/en, auto-adapts to locale (`LC_ALL` > `LC_MESSAGES` > `LANG` > macOS `AppleLocale`) |
 
 ## Install
 
-`package.json` declares both `omp.extensions` and `pi.extensions`, so the same package loads on either runtime. Pick the method that fits:
-
-**Option A — drop into the extensions directory:**
-
 ```sh
-# OMP
-cp -r smart-approve ~/.omp/agent/extensions/smart-approve
-# pi-agent
-cp -r smart-approve ~/.pi/agent/extensions/smart-approve
+npm install smart-approve
 ```
 
-Restart the host. The hook is active for all sessions.
-
-**Option B — point the `extensions` setting at it:**
+Then configure OMP to load the extension and disable the built-in bash:
 
 ```yaml
 # ~/.omp/agent/config.yml   (or ~/.pi/agent/config.yml for pi-agent)
 extensions:
-  - /path/to/smart-approve
-```
-
-**Option C — load once via CLI flag:**
-
-```sh
-omp --extension ./smart-approve      # OMP
-pi  --extension ./smart-approve      # pi-agent
-```
-
-## Required configuration
-
-Set `tools.approvalMode: yolo` so safe commands auto-approve and pass through. This hook then acts as the **sole gate** for dangerous commands:
-
-```yaml
-# ~/.omp/agent/config.yml   (or ~/.pi/agent/config.yml for pi-agent)
+  - smart-approve
+bash:
+  enabled: false
 tools:
   approvalMode: yolo
-extensions:
-  - /path/to/smart-approve
 ```
 
-Without `yolo`, the host's built-in approval already prompts for `exec`-tier tools (including `bash`), making this hook redundant for interactive sessions — though its headless-block behavior still applies to subagents.
+- `bash.enabled: false` — removes OMP's built-in bash tool so the custom tool can replace it
+- `tools.approvalMode: yolo` — auto-approve safe commands; this extension is the sole gate for dangerous ones
+- `extensions: [smart-approve]` — load the extension from `node_modules`
 
 Restart the host after installing or editing.
+
+## Configuration
+
+Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve.json` on pi-agent). All fields are optional — defaults apply when missing:
+
+```json
+{
+  "enabled": true,
+  "protectedPaths": [
+    ".env", ".env.*", "!.env.example",
+    "**/.ssh/**", "**/.kube/config", "**/.aws/credentials",
+    "**/*.pem", "**/*.key", "**/*.p12", "**/*.kdbx",
+    "**/id_rsa", "**/id_ed25519", "**/auth.json"
+  ],
+  "llmAnalysis": true,
+  "rememberDecisions": true,
+  "contextMaxChars": 3000,
+  "model": "@smol"
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Master switch |
+| `protectedPaths` | 20+ built-in patterns | Glob patterns for write/edit interception; `!` prefix negates |
+| `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = rule-only confirmation |
+| `rememberDecisions` | `true` | Whether to offer session/permanent remember options in the dialog |
+| `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
+| `model` | `@smol` | Model spec for risk analysis (role alias, provider/id, or bare id); falls back to `@default` if unavailable |
 
 ## Allow-list (decision memory)
 
@@ -202,59 +216,40 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 
 | API | Purpose |
 |---|---|
-| `pi.on("tool_call", handler)` | Intercept `bash`, `write`, `edit` calls |
-| `event.toolName`, `event.input.command` / `event.input.path` | Read tool name and input |
+| `pi.registerTool({ name, parameters, execute })` | Register custom "bash" tool replacing built-in |
+| `pi.zod` | Injected zod module for tool parameter schemas |
+| `pi.exec("bash", ["-c", cmd], opts)` | Execute approved commands |
+| `pi.exec(bin, ["-p", ...], opts)` | Spawn host binary for one-shot LLM risk analysis |
+| `pi.on("tool_call", handler)` | Intercept `write`/`edit` on protected paths |
 | `ctx.hasUI` | Detect headless/subagent context |
 | `ctx.sessionManager.getBranch()` / `getEntries()` | Gather session context for LLM review |
 | `ctx.ui.setStatus(id, text)` | Show "analyzing…" status |
 | `ctx.ui.confirm(title, body)` | Confirmation dialog (fallback when `select` unavailable) |
 | `ctx.ui.select(title, choices)` | Three-way choice: session allow / permanent allow / deny |
-| `pi.exec(bin, args, opts)` | Spawn `<host> -p` (`omp` or `pi`) for LLM risk analysis |
-| `return { block: true, reason }` | Block contract: `reason` is sent to the LLM |
-
-## Compatibility — OMP and pi-agent
-
-The extension contract (`ExtensionAPI`, `tool_call` event, `ctx.ui.confirm`/`select`, `ctx.hasUI`, `pi.exec`) is shared between OMP and upstream pi-agent. The `package.json` therefore declares both `omp.extensions` and `pi.extensions` manifest keys.
-
-**This extension works on both OMP and pi-agent.** The LLM risk-analysis step auto-detects the host binary at runtime:
-
-| Concern | Status | Detail |
-|---|---|---|
-| Extension factory + `tool_call` interception | Portable | Standard `ExtensionAPI` surface; works on pi-agent |
-| `ctx.ui.confirm` / `select` / `setStatus` / `hasUI` | Portable | Same `ExtensionUIContext` interface on both |
-| Behavior detection, protected paths, decision memory, i18n | Portable | Pure TS, no host coupling |
-| **Session context gathering** | Best-effort | Uses `ctx.sessionManager.getBranch()` / `getEntries()`. Falls back to `null` (no context) if unavailable — LLM review still works |
-| **Host binary detection** | Portable | `detectHost()` probes PATH for `omp` first, then `pi`. Cached for process lifetime |
-| **One-shot model invocation** | Portable | `runOneShotModel()` uses flags shared by both (`-p --no-tools --no-session --no-lsp --no-extensions --no-skills --no-rules --no-title --model @smol`) |
-| **Fallback chain** | Portable | `omp` absent or fails → retries `pi` → both fail returns `null` → rule-only confirmation |
-
-**On pi-agent (only `pi` on PATH):** `detectHost()` returns `"pi"`; the smol model is invoked via `pi -p`. Full LLM risk analysis works. Only when neither binary is found does the hook degrade to rule-only confirmation.
-
-**On a host with neither binary:** LLM analysis is skipped (returns `null`); core safety (behavior detection, protected path matching, blocking, confirmation dialog) still works — the risk/summary/detail/recommend fields in the dialog are simply absent.
-
-## Comparison with marketplace alternatives
-
-| Dimension | smart-approve | pi-auto-reviewer | @firstpick/safety-guard |
-|---|---|---|---|
-| Host compatibility | OMP + pi dual | pi only | pi only |
-| LLM analysis | smol structured JSON display | ALLOW/BLOCK decision | None |
-| Behavior detection | Argument parsing + regex net | Argument parsing + regex | Regex only |
-| write/edit interception | Yes (symlink-aware) | No | Yes |
-| Decision memory | Session + permanent | None | Session + permanent |
-| Session context | Yes (injection-guarded) | Yes | No |
-| Bilingual | zh/en | No | No |
-| Fallback chain | omp→pi→rule confirmation | pi→fail block | Rule confirmation |
+| `return { block: true, reason }` | Block contract for `tool_call` handler (write/edit only) |
 
 ## Project layout
 
 ```
 smart-approve/
-├── README.md        ← this file
-├── package.json     ← omp.extensions / pi.extensions manifest (v2.0.0)
-├── LICENSE          ← MIT
-└── index.ts         ← full source: types + behavior detection + regex rules +
-                        protected paths + config + decision memory +
-                        session context + LLM invocation + hook entry
+├── README.md
+├── package.json          ← omp.extensions / pi.extensions manifest (v2.4.0)
+├── LICENSE               ← MIT
+├── src/
+│   ├── index.ts          ← SmartApprove orchestrator: register bash tool + write/edit hook
+│   ├── bash-tool.ts      ← custom "bash" tool (replaces built-in)
+│   ├── types.ts          ← ExtensionAPI, ToolDefinition, AgentToolResult, etc.
+│   ├── host.ts           ← HostResolver + ModelInvoker (one-shot LLM via host -p)
+│   ├── behaviors.ts      ← behavior catalog, git parser, composite analysis
+│   ├── paths.ts          ← ProtectedPathMatcher (symlink-aware)
+│   ├── config.ts         ← ConfigStore
+│   ├── allowlist.ts      ← AllowList (session + permanent)
+│   ├── context.ts        ← SessionContextGatherer
+│   ├── dialog.ts         ← confirmWithRemember + formatAnalysis
+│   ├── i18n.ts           ← locale detection + bilingual strings (zh/en)
+│   └── logger.ts         ← Logger (file + stderr)
+└── dist/
+    └── index.js          ← bundled output (bun build, ~44KB)
 ```
 
 ### Runtime artifacts
@@ -262,6 +257,7 @@ smart-approve/
 ```
 ~/.omp/agent/smart-approve.json          — config (user-editable)
 ~/.omp/agent/smart-approve-allow.json    — permanent allow-list (auto-maintained)
+~/.omp/logs/smart-approve.log            — diagnostic log
 ```
 
 ## License
