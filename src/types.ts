@@ -91,6 +91,12 @@ export interface ExtensionCtx {
     setStatus: (id: string, text: string | undefined) => void;
     notify?: (msg: string, level: "info" | "warning") => void;
   };
+  /** Delegate to the native built-in tool of the same name. */
+  invokeTool?: <TDetails = unknown>(
+    params: Record<string, unknown>,
+    options?: { signal?: AbortSignal; onUpdate?: unknown },
+  ) => Promise<AgentToolResult<TDetails>>;
+
 }
 
 // ── Domain value objects ─────────────────────────────────────────────

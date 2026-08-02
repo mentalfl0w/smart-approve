@@ -28,7 +28,7 @@ LLM calls bash tool
                   session   → in-memory Set (cleared on restart)
                   permanent → persisted to JSON file
                   deny      → block
-              approved → pi.exec("bash", ["-c", cmd]) → return output to LLM
+              approved → ctx.invokeTool() delegates to native bash tool → return output to LLM
 ```
 
 **write/edit to protected paths** is handled separately via the `tool_call` hook — pure path matching + confirmation dialog, no LLM analysis (the path itself is sufficient signal).
@@ -37,9 +37,9 @@ LLM calls bash tool
 
 OMP's `EXTENSION_HANDLER_TIMEOUT_MS` (30s, hardcoded) wraps `tool_call` event handler dispatch — but **not** custom tool `execute()` methods. This extension exploits that:
 
-1. `config.yml: bash.enabled: false` — removes OMP's built-in bash tool
-2. `pi.registerTool({ name: "bash", ... })` — registers a replacement with the same name
-3. All approval logic (behavior detection → LLM analysis → `ui.select` → execution) lives inside `execute()`, free from the 30s timeout
+1. `pi.registerTool({ name: "bash", ... })` — registers a replacement with the same name, shadowing the built-in
+2. All approval logic (behavior detection → LLM analysis → `ui.select` → execution) lives inside `execute()`, free from the 30s timeout
+3. Execution is delegated to the native bash tool via `ctx.invokeTool()`, inheriting shell path resolution, env hardening, PTY, and output truncation
 
 The previous architecture intercepted bash via `pi.on("tool_call")` and was killed by the 30s timeout during LLM analysis. The custom tool architecture eliminates this entirely.
 
@@ -117,19 +117,17 @@ The following behaviors are **always hard-blocked** — no LLM review, no dialog
 - Disk format (`mkfs`, `dd` to block device)
 - Shutdown / reboot
 
-### 7. Non-interactive command execution
+### 7. Execution via native bash tool delegation
 
-Commands are executed via `pi.exec("bash", ["-c", cmd])` with a hardened non-interactive environment:
+Commands are never executed directly by the extension. After passing the approval gate, execution is delegated to OMP's built-in bash tool via `ctx.invokeTool()`. This inherits all native behavior:
 
-- `PAGER=cat`, `GIT_PAGER=cat`, `LESS=FRX` — no pager hangs
-- `GIT_TERMINAL_PROMPT=0`, `SSH_ASKPASS=/usr/bin/false` — no credential prompts
-- `EDITOR=true`, `VISUAL=true` — no editor launches
-- `TERM=dumb`, `NO_COLOR=1`, `CI=1` — clean output
-- Inherits `process.env` (including `PATH`) so all binaries are accessible
-
-Output is truncated (20KB head + 50KB tail with elision marker) to match OMP's built-in bash tool behavior.
-
+- **Shell path resolution** — no ENOENT from missing PATH in worker processes
+- **PTY support** — interactive commands work when the native tool uses PTY
+- **Env hardening** — `PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, etc.
+- **Output truncation** — head/tail windows with artifact spill
+- **Cross-platform** — no hardcoded binary paths
 ### 8. OMP + pi dual compatibility with graceful degradation
+
 
 | Aspect | Implementation |
 |---|---|
@@ -152,13 +150,10 @@ Then configure OMP to load the extension and disable the built-in bash:
 # ~/.omp/agent/config.yml   (or ~/.pi/agent/config.yml for pi-agent)
 extensions:
   - smart-approve
-bash:
-  enabled: false
 tools:
   approvalMode: yolo
 ```
 
-- `bash.enabled: false` — removes OMP's built-in bash tool so the custom tool can replace it
 - `tools.approvalMode: yolo` — auto-approve safe commands; this extension is the sole gate for dangerous ones
 - `extensions: [smart-approve]` — load the extension from `node_modules`
 
@@ -216,9 +211,9 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 
 | API | Purpose |
 |---|---|
-| `pi.registerTool({ name, parameters, execute })` | Register custom "bash" tool replacing built-in |
+| `pi.registerTool({ name, parameters, execute })` | Register custom "bash" tool shadowing the built-in |
 | `pi.zod` | Injected zod module for tool parameter schemas |
-| `pi.exec("bash", ["-c", cmd], opts)` | Execute approved commands |
+| `ctx.invokeTool(params, opts)` | Delegate execution to native bash tool |
 | `pi.exec(bin, ["-p", ...], opts)` | Spawn host binary for one-shot LLM risk analysis |
 | `pi.on("tool_call", handler)` | Intercept `write`/`edit` on protected paths |
 | `ctx.hasUI` | Detect headless/subagent context |
@@ -233,11 +228,11 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 ```
 smart-approve/
 ├── README.md
-├── package.json          ← omp.extensions / pi.extensions manifest (v2.4.0)
+├── package.json          ← omp.extensions / pi.extensions manifest (v2.4.1)
 ├── LICENSE               ← MIT
 ├── src/
 │   ├── index.ts          ← SmartApprove orchestrator: register bash tool + write/edit hook
-│   ├── bash-tool.ts      ← custom "bash" tool (replaces built-in)
+│   ├── bash-tool.ts      ← custom "bash" tool (shadows built-in, delegates via ctx.invokeTool)
 │   ├── types.ts          ← ExtensionAPI, ToolDefinition, AgentToolResult, etc.
 │   ├── host.ts           ← HostResolver + ModelInvoker (one-shot LLM via host -p)
 │   ├── behaviors.ts      ← behavior catalog, git parser, composite analysis
