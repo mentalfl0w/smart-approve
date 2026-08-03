@@ -53,8 +53,9 @@ export interface BashToolDeps {
 /**
  * Register the custom "bash" tool that replaces the built-in one.
  *
- * Requires `bash.enabled: false` in config.yml to avoid tool-name conflict
- * with the built-in bash tool.
+ * No special config needed — the custom tool with the same name "bash"
+ * shadows the built-in via name collision; execution is delegated to the
+ * native implementation through ctx.invokeTool().
  */
 export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
   const z = pi.zod;

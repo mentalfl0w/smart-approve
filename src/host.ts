@@ -2,8 +2,9 @@
  * Smart Approve — host resolution + one-shot LLM invocation.
  *
  * Resolves the host binary path (the process that launched this extension)
- * and runs the smol model in print mode for risk analysis.  All diagnostic
- * detail flows through the Logger so failures are traceable end-to-end.
+ * and drives the smol model through a persistent RPC child for risk
+ * analysis.  All diagnostic detail flows through the Logger so failures
+ * are traceable end-to-end.
  */
 
 import * as fs from "node:fs";
@@ -109,11 +110,13 @@ export class HostResolver {
 }
 
 /**
- * Runs one-shot model invocations via the host binary's print mode.
+ * Runs one-shot model invocations through a persistent `omp --mode rpc`
+ * child (see RpcModelInvoker).
  *
  * The model spec comes from SmartApproveConfig (defaulting to @smol).
- * No timeout is applied — the subprocess runs to completion. In the
- * custom tool's execute() path there is no 30s pressure. If @smol is
+ * Each attempt is bounded by analysisTimeoutMs; a hung remote model
+ * degrades to rule-label confirmation instead of hanging. In the custom
+ * tool's execute() path there is no 30s pressure. If @smol is
  * unconfigured, falls back to @default automatically.
  */
 export class ModelInvoker {

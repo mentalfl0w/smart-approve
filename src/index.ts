@@ -10,9 +10,11 @@
  * (the 30s budget is sufficient for path matching + confirmation dialog).
  *
  * Setup:
- *   config.yml: bash.enabled: false  (removes built-in bash tool)
  *   config.yml: tools.approvalMode: yolo
  *   smart-approve.json: llmAnalysis, model, ...
+ *
+ * The custom "bash" tool shadows the built-in by name — no bash.enabled
+ * change is needed.
  *
  * Configuration: ~/.omp/agent/smart-approve.json (or ~/.pi/agent/... on pi)
  * Allow-list:     ~/.omp/agent/smart-approve-allow.json
