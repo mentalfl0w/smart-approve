@@ -22,6 +22,9 @@ export interface SmartApproveConfig {
   rememberDecisions: boolean;
   /** Max characters of session context to feed the LLM. */
   contextMaxChars: number;
+  /** Timeout for the one-shot LLM risk analysis, in milliseconds.
+   *  0 = no timeout (analysis can hang indefinitely). Default 30s. */
+  analysisTimeoutMs: number;
   /** Model spec for the one-shot risk analysis. Accepts any string the omp
    *  --model flag accepts: role alias (@smol / @tiny / @slow), provider/id,
    *  or bare id. Default @smol — the fast online role, returns within the
@@ -35,6 +38,7 @@ const DEFAULT_CONFIG: SmartApproveConfig = {
   llmAnalysis: true,
   rememberDecisions: true,
   contextMaxChars: 3000,
+  analysisTimeoutMs: 30_000,
   model: "@smol",
 };
 
@@ -48,6 +52,9 @@ function mergeConfig(user: unknown): SmartApproveConfig {
     llmAnalysis: typeof u.llmAnalysis === "boolean" ? u.llmAnalysis : DEFAULT_CONFIG.llmAnalysis,
     rememberDecisions: typeof u.rememberDecisions === "boolean" ? u.rememberDecisions : DEFAULT_CONFIG.rememberDecisions,
     contextMaxChars: typeof u.contextMaxChars === "number" ? u.contextMaxChars : DEFAULT_CONFIG.contextMaxChars,
+    analysisTimeoutMs: typeof u.analysisTimeoutMs === "number" && u.analysisTimeoutMs >= 0
+      ? u.analysisTimeoutMs
+      : DEFAULT_CONFIG.analysisTimeoutMs,
     model: typeof u.model === "string" && u.model.trim() ? u.model.trim() : DEFAULT_CONFIG.model,
   };
 }

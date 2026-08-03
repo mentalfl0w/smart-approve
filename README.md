@@ -177,6 +177,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
   "llmAnalysis": true,
   "rememberDecisions": true,
   "contextMaxChars": 3000,
+  "analysisTimeoutMs": 30000,
   "model": "@smol"
 }
 ```
@@ -188,6 +189,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = rule-only confirmation |
 | `rememberDecisions` | `true` | Whether to offer session/permanent remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
+| `analysisTimeoutMs` | `30000` | Per-call timeout for the one-shot LLM analysis in ms; `0` = no timeout. On timeout, falls back to `@default` (also time-bounded) then rule-label confirmation |
 | `model` | `@smol` | Model spec for risk analysis (role alias, provider/id, or bare id); falls back to `@default` if unavailable |
 
 ## Allow-list (decision memory)

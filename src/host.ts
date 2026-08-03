@@ -118,10 +118,13 @@ export class HostResolver {
 export class ModelInvoker {
   private readonly host: HostResolver;
   private readonly logger: Logger;
+  private readonly timeoutMs: number;
 
-  constructor(host: HostResolver, logger: Logger) {
+  /** @param timeoutMs Bounded wait for the one-shot model call (0 = no timeout). */
+  constructor(host: HostResolver, logger: Logger, timeoutMs: number) {
     this.host = host;
     this.logger = logger;
+    this.timeoutMs = timeoutMs;
   }
 
   /** Run the configured model on a prompt, parse JSON, return the analysis. */
@@ -146,12 +149,19 @@ export class ModelInvoker {
         "--no-title",
         "--model", m,
         prompt,
-      ]);
+      ], {
+        // Bounded wait: a hung remote model must not freeze the bash tool.
+        // On timeout the analysis degrades to rule-label confirmation.
+        // 0 = no timeout (legacy behavior).
+        ...(this.timeoutMs > 0 ? { timeout: this.timeoutMs } : {}),
+      });
     };
 
     try {
       let result = await run(model);
-      // Fallback: if @smol role is unconfigured, retry with @default
+      // Fallback: if @smol role is unconfigured or the call failed
+      // (including timeout), retry with @default. Each run() call has its
+      // own bounded timeout, so the retry cannot hang indefinitely either.
       if (result.code !== 0 && model === "@smol") {
         this.logger.log(`runOneShotModel: @smol failed (exit ${result.code}), retrying with @default`);
         result = await run("@default");

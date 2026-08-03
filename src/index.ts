@@ -70,7 +70,7 @@ class SmartApprove {
     this.pathMatcher = new ProtectedPathMatcher(this.configStore.config.protectedPaths);
     this.contextGatherer = new SessionContextGatherer(this.logger);
     const host = new HostResolver(this.logger);
-    this.modelInvoker = new ModelInvoker(host, this.logger);
+    this.modelInvoker = new ModelInvoker(host, this.logger, this.configStore.config.analysisTimeoutMs);
   }
 
   /** Register the custom bash tool + write/edit hook. No-op if disabled. */
