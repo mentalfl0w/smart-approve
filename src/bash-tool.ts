@@ -115,22 +115,13 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         return ctx.invokeTool(nativeParams, { signal, onUpdate });
       };
 
-      // 1. Allowlist hit → delegate directly
-      if (config.rememberDecisions && allowList.isAllowed("bash", cmd, effectiveCwd)) {
-        logger.log(`bash-tool: allowlist hit, delegating to native`);
-        return delegate();
-      }
-
-      // 2. Behavior analysis
+      // 1. Behavior analysis FIRST — hard-block must win over allowlist
+      //    (allowlist entries can predate a rule upgrade, or be hand-edited).
       const analysis = analyzeCommand(cmd);
-      if (analysis.behaviors.length === 0) {
-        // Safe command — delegate directly
-        return delegate();
-      }
-
       const label = analysis.labels[0]?.[lang] || analysis.labels[0]?.en || "danger";
 
-      // 3. Hard-block behaviors (rm -rf /, fork bombs, curl|sh, etc.)
+      // 2. Hard-block behaviors (rm -rf /, fork bombs, curl|sh, etc.) —
+      //    no allowlist override, no dialog, no LLM review.
       if (analysis.hardBlocked) {
         logger.log(`bash-tool: hard-blocked (${label})`);
         return {
@@ -140,7 +131,18 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         };
       }
 
-      // 4. Dangerous but reviewable — need UI
+      // 3. Allowlist hit → delegate directly
+      if (config.rememberDecisions && allowList.isAllowed("bash", cmd, effectiveCwd)) {
+        logger.log(`bash-tool: allowlist hit, delegating to native`);
+        return delegate();
+      }
+
+      // 4. No dangerous behavior — delegate directly
+      if (analysis.behaviors.length === 0) {
+        return delegate();
+      }
+
+      // 5. Dangerous but reviewable — need UI
       if (!hasUI) {
         logger.log(`bash-tool: blocked (no UI) — ${label}`);
         return {
@@ -150,7 +152,7 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         };
       }
 
-      // 5. LLM risk analysis (optional, no 30s pressure)
+      // 6. LLM risk analysis (optional, no 30s pressure)
       let analysisText: string | null = null;
       if (config.llmAnalysis) {
         ctx.ui.setStatus("smart-approve", t.analyzing);
@@ -171,7 +173,7 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         }
       }
 
-      // 6. Approval dialog (no 30s timeout — inside execute(), not a handler)
+      // 7. Approval dialog (no 30s timeout — inside execute(), not a handler)
       const title = t.confirmTitle(label);
       const body = analysisText
         ? `${analysisText}\n\n────────\n${t.command}: ${cmd}\n\n${t.allowPrompt}`
@@ -194,7 +196,7 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         allowList.rememberPermanent("bash", cmd, effectiveCwd);
       }
 
-      // 7. Execute — delegate to native bash tool
+      // 8. Execute — delegate to native bash tool
       logger.log(`bash-tool: user approved, delegating to native`);
       return delegate();
     },

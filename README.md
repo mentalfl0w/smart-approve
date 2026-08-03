@@ -9,13 +9,13 @@ Safe commands pass through with **zero interruption**. When a dangerous behavior
 ```
 LLM calls bash tool
        │
-   allow-list hit (session or permanent)? ── yes → execute
-       │ no
    analyzeCommand() — argument parsing + regex secondary net
-       ├─ no behaviors → execute (zero interruption)
        ├─ hard-block (rm -rf /, fork bomb, curl|sh…) → block always
+       ├─ no behaviors → execute (zero interruption)
        └─ dangerous behavior → needs review ↓
               │
+          allow-list hit (session or permanent)? ── yes → execute
+              │ no
           ctx.hasUI === false (headless) → block
               │ has UI:
               setStatus("analyzing…")
@@ -30,6 +30,8 @@ LLM calls bash tool
                   deny      → block
               approved → ctx.invokeTool() delegates to native bash tool → return output to LLM
 ```
+
+Hard-block wins over the allow-list: an entry that predates a rule upgrade (or was hand-edited into `smart-approve-allow.json`) can never bypass a hard-block.
 
 **write/edit to protected paths** is handled separately via the `tool_call` hook — pure path matching + confirmation dialog, no LLM analysis (the path itself is sufficient signal).
 

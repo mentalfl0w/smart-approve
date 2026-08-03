@@ -118,10 +118,13 @@ class SmartApprove {
     const cwd = ctx.cwd || process.cwd();
     const t = this.t;
 
+    // Protected check FIRST — non-protected paths never consult the
+    // allowlist (mirrors the bash chain: hard-block before allowlist).
+    if (!this.pathMatcher.isProtected(filePath)) return;
+
     if (config.rememberDecisions && this.allowList.isAllowed(event.toolName, filePath, cwd)) {
       return;
     }
-    if (!this.pathMatcher.isProtected(filePath)) return;
 
     if (!ctx.hasUI) {
       return { block: true, reason: t.blockedPathNoUI(filePath) };

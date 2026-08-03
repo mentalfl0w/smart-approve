@@ -64,7 +64,12 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
 
 const DANGER_RULES: Array<{ pattern: RegExp; behavior: string }> = [
   // — Recursive force delete —
-  { pattern: /(?:^|[\s;&|])rm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+/,
+  // Case-insensitive (-Rf == -rf) and long-form (--recursive --force).
+  { pattern: /(?:^|[\s;&|])rm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+/i,
+    behavior: "recursive-force-delete" },
+  { pattern: /\brm\s+--recursive(?:\s+--force|\s*$)/i,
+    behavior: "recursive-force-delete" },
+  { pattern: /\brm\s+--force(?:\s+--recursive|\s*$)/i,
     behavior: "recursive-force-delete" },
   { pattern: /\brmdir\s+(?:-[a-zA-Z]*p[a-zA-Z]*)?\s*\//,
     behavior: "recursive-force-delete" },

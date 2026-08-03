@@ -7,6 +7,7 @@
  */
 
 import * as fs from "node:fs";
+import { execSync } from "node:child_process";
 import type { ExtensionAPI, ExecResult, RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
@@ -83,16 +84,20 @@ export class HostResolver {
 
   /** PATH lookup via `command -v omp` / `command -v pi`. */
   private tryPathLookup(): string | null {
-    const { execSync } = require("child_process");
     for (const bin of ["omp", "pi"]) {
       try {
-        execSync(`command -v ${bin}`, {
+        const out = execSync(`command -v ${bin}`, {
           stdio: ["pipe", "pipe", "ignore"],
           timeout: 2000,
           encoding: "utf-8",
-        })
-        this.logger.log(`getHostBin: PATH lookup resolved ${bin}`)
-        return bin
+        });
+        const resolved = out.trim();
+        // Resolve to an absolute path — a bare name would fail to spawn
+        // in worker processes with an incomplete PATH (posix_spawn ENOENT).
+        if (resolved && resolved.includes("/")) {
+          this.logger.log(`getHostBin: PATH lookup resolved ${resolved}`);
+          return resolved;
+        }
       } catch {
         // not found
       }
