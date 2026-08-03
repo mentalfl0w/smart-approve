@@ -162,7 +162,7 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
           const behaviorLabels = analysis.labels.map((l) => l[lang] || l.en);
           logger.log(`bash-tool: analyzeRisk cmd="${cmd.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`);
           const result = await modelInvoker.analyze(
-            pi, cmd, behaviorLabels, contextSection, t, config.model, signal,
+            cmd, behaviorLabels, contextSection, t, config.model, signal,
           );
           analysisText = formatAnalysis(result, t);
           logger.log(`bash-tool: analysisText=${analysisText ? "OK" : "null"}`);

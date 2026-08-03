@@ -121,13 +121,12 @@ export class RpcModelInvoker {
     if (opts.signal?.aborted) return null;
 
     // Ensure the child runs with the requested model; respawn on spec change.
+    // (When the model matches and the child is healthy, reuse it as-is.)
     if (model !== this.currentModel || !this.isAlive) {
       this.logger.log(`rpc: model change ${this.currentModel ?? "(none)"} -> ${model}, restarting`);
       this.kill();
       this.spawnPromise = this.spawn(model);
       await this.spawnPromise;
-    } else {
-      await this.ensure();
     }
 
     const id = `sa-${++this.seq}`;
@@ -229,14 +228,6 @@ export class RpcModelInvoker {
       else this.failPending(`process exited (code ${code})`);
     });
     return promise;
-  }
-
-  /** Ensure a healthy child exists (no-op when already alive/spawning). */
-  private ensure(): Promise<void> {
-    if (this.isAlive) return Promise.resolve();
-    if (this.spawnPromise) return this.spawnPromise;
-    this.spawnPromise = this.spawn(this.currentModel ?? "@smol");
-    return this.spawnPromise;
   }
 
   /** Dispatch an inbound frame after ready. */

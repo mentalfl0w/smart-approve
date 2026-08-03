@@ -8,7 +8,7 @@
 
 import * as fs from "node:fs";
 import { execSync } from "node:child_process";
-import type { ExtensionAPI, ExecResult, RiskAnalysis } from "./types";
+import type { RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
 import { RpcModelInvoker } from "./rpc-invoker";
@@ -131,7 +131,6 @@ export class ModelInvoker {
 
   /** Run the configured model on a prompt, parse JSON, return the analysis. */
   async invoke(
-    pi: ExtensionAPI,
     prompt: string,
     model: string,
     signal?: AbortSignal,
@@ -189,7 +188,6 @@ export class ModelInvoker {
    * so this method stays focused on prompt assembly + invocation.
    */
   async analyze(
-    pi: ExtensionAPI,
     cmd: string,
     behaviorLabels: string[],
     contextSection: string,
@@ -221,7 +219,7 @@ export class ModelInvoker {
       t.promptOnlyJson,
     ].join("\n");
 
-    return this.invoke(pi, prompt, model, signal);
+    return this.invoke(prompt, model, signal);
   }
 
 }
