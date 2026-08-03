@@ -20,8 +20,8 @@ LLM calls bash tool
               │ has UI:
               setStatus("analyzing…")
               gatherSessionContext() — original user task + recent agent plan
-              RPC prompt → @smol (bounded by analysisTimeoutMs)
-                  @smol fails/times out? → retry with @default (also bounded)
+              RPC prompt → @tiny (bounded by analysisTimeoutMs)
+                  @tiny fails/times out? → @smol → @default (each bounded)
                   success → dialog shows risk / summary / detail / recommendation
                   failure → dialog shows rule-based label only
               ctx.ui.select(title, [session allow, permanent allow, deny])
@@ -51,7 +51,7 @@ Risk analysis does **not** cold-start a new `omp -p` subprocess per call. Instea
 
 - **One process, many prompts** — extension loading (including `provider-retry-proxy`) and process startup are paid once per host session, not per analysis
 - **Per-attempt timeout** — each prompt is bounded by `analysisTimeoutMs` (default 30s, `0` = no timeout); a hung remote model cannot freeze the bash tool
-- **Model fallback** — `@smol` fails or times out → respawn with `@default` (also time-bounded) → rule-label confirmation
+- **Model fallback chain** — @tiny first (cheapest), then @smol, then @default; each attempt time-bounded; total failure degrades to rule-label confirmation
 - **Interruption** — the tool's `AbortSignal` is forwarded to the RPC child (`abort` command), so a user interrupt cancels an in-flight analysis instead of leaving it running
 - **Lifecycle** — the child is lazily spawned on first use, killed via `session_shutdown`, and exits on its own if the host dies (stdin EOF closes → process exits code 0, no orphans)
 
@@ -142,7 +142,7 @@ Commands are never executed directly by the extension. After passing the approva
 | Dual manifest | `package.json` declares both `omp.extensions` and `pi.extensions` |
 | Host detection | `process.execPath` → `process.argv[1]` → PATH lookup (`omp` → `pi`) |
 | LLM invocation | Persistent `omp --mode rpc` / `pi --mode rpc` child, JSONL over stdio |
-| Model fallback | `@smol` fails/times out → retry `@default` → rule-only confirmation (no LLM) |
+| Model fallback | @tiny → @smol → @default (each time-bounded) → rule-only confirmation (no LLM) |
 | Headless | `ctx.hasUI === false` blocks all dangerous operations immediately |
 | Bilingual | zh/en, auto-adapts to locale (`LC_ALL` > `LC_MESSAGES` > `LANG` > macOS `AppleLocale`) |
 
@@ -195,8 +195,8 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = rule-only confirmation |
 | `rememberDecisions` | `true` | Whether to offer session/permanent remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
-| `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure, falls back to `@default` (also time-bounded) then rule-label confirmation |
-| `model` | `@smol` | Model spec for risk analysis (role alias, provider/id, or bare id); falls back to `@default` if unavailable |
+| `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure the model chain advances @tiny → @smol → @default, then rule-label confirmation |
+| `model` | `@smol` | Model spec for risk analysis (role alias, provider/id, or bare id). Attempt chain: configured model runs first, then @tiny → @smol → @default as fallbacks (deduped) |
 
 ## Allow-list (decision memory)
 

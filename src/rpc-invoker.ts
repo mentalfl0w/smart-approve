@@ -175,6 +175,8 @@ export class RpcModelInvoker {
       "--no-title",
       "--no-prewalk",
       "--no-pty",
+      "--thinking=off",
+      "--max-time=300",
     ], {
       stdio: ["pipe", "pipe", "pipe"],
     });

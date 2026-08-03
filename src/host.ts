@@ -153,17 +153,24 @@ export class ModelInvoker {
     };
 
     try {
-      let text = await run(model);
-      // Fallback: if @smol role is unconfigured or the call failed
-      // (including timeout), retry with @default. Each attempt has its
-      // own bounded timeout, so the retry cannot hang indefinitely either.
-      if (!text && model === "@smol") {
-        this.logger.log(`runOneShotModel: @smol failed, retrying with @default`);
-        text = await run("@default");
+      // Attempt chain: cheap-first. With the default @smol config this is
+      // @tiny -> @smol -> @default. A non-default configured model runs
+      // first, then the cheap fallbacks are appended (deduped).
+      const chain =
+        model === "@smol"
+          ? ["@tiny", "@smol", "@default"]
+          : [...new Set([model, "@tiny", "@smol", "@default"])];
+
+      let text: string | null = null;
+      for (const m of chain) {
+        if (signal?.aborted) break;
+        text = await run(m);
+        if (text) break;
+        this.logger.log(`runOneShotModel: ${m} failed, trying next in chain`);
       }
 
       if (!text) {
-        this.logger.log("runOneShotModel: no output from model");
+        this.logger.log("runOneShotModel: all models in chain failed");
         return null;
       }
       const parsed = extractJson(text);
