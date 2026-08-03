@@ -153,13 +153,10 @@ export class ModelInvoker {
     };
 
     try {
-      // Attempt chain: cheap-first. With the default @smol config this is
-      // @tiny -> @smol -> @default. A non-default configured model runs
-      // first, then the cheap fallbacks are appended (deduped).
-      const chain =
-        model === "@smol"
-          ? ["@tiny", "@smol", "@default"]
-          : [...new Set([model, "@tiny", "@smol", "@default"])];
+      // Attempt chain: configured model first (default @tiny), then the
+      // standard fallbacks @tiny -> @smol -> @default, deduped. So the
+      // default config yields @tiny -> @smol -> @default.
+      const chain = [...new Set([model, "@tiny", "@smol", "@default"])];
 
       let text: string | null = null;
       for (const m of chain) {

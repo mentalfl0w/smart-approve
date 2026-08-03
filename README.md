@@ -184,7 +184,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
   "rememberDecisions": true,
   "contextMaxChars": 3000,
   "analysisTimeoutMs": 30000,
-  "model": "@smol"
+  "model": "@tiny"
 }
 ```
 
@@ -196,7 +196,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `rememberDecisions` | `true` | Whether to offer session/permanent remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
 | `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure the model chain advances @tiny → @smol → @default, then rule-label confirmation |
-| `model` | `@smol` | Model spec for risk analysis (role alias, provider/id, or bare id). Attempt chain: configured model runs first, then @tiny → @smol → @default as fallbacks (deduped) |
+| `model` | `@tiny` | Model spec for risk analysis (role alias, provider/id, or bare id). Attempt chain: configured model runs first, then @tiny → @smol → @default as fallbacks (deduped) |
 
 ## Allow-list (decision memory)
 

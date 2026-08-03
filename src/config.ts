@@ -26,9 +26,9 @@ export interface SmartApproveConfig {
    *  0 = no timeout (analysis can hang indefinitely). Default 30s. */
   analysisTimeoutMs: number;
   /** Model spec for the one-shot risk analysis. Accepts any string the omp
-   *  --model flag accepts: role alias (@smol / @tiny / @slow), provider/id,
-   *  or bare id. Default @smol — the fast online role, returns within the
-   *  3s race window more often than @tiny (local ONNX, ~20s). */
+   *  --model flag accepts: role alias (@tiny / @smol / @slow), provider/id,
+   *  or bare id. Default @tiny — the cheapest role, first in the fallback
+   *  chain @tiny -> @smol -> @default. */
   model: string;
 }
 
@@ -39,7 +39,7 @@ const DEFAULT_CONFIG: SmartApproveConfig = {
   rememberDecisions: true,
   contextMaxChars: 3000,
   analysisTimeoutMs: 30_000,
-  model: "@smol",
+  model: "@tiny",
 };
 
 /** Deep-merge user config over defaults (arrays replaced, not concatenated). */
