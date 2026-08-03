@@ -11,6 +11,7 @@ import { execSync } from "node:child_process";
 import type { ExtensionAPI, ExecResult, RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
+import { RpcModelInvoker } from "./rpc-invoker";
 
 /** Extract JSON object from model output (handles ```json fences and bare JSON). */
 function extractJson(text: string): RiskAnalysis | null {
@@ -119,8 +120,9 @@ export class ModelInvoker {
   private readonly host: HostResolver;
   private readonly logger: Logger;
   private readonly timeoutMs: number;
+  private rpc: RpcModelInvoker | null = null;
 
-  /** @param timeoutMs Bounded wait for the one-shot model call (0 = no timeout). */
+  /** @param timeoutMs Bounded wait per model attempt (0 = no timeout). */
   constructor(host: HostResolver, logger: Logger, timeoutMs: number) {
     this.host = host;
     this.logger = logger;
@@ -132,54 +134,51 @@ export class ModelInvoker {
     pi: ExtensionAPI,
     prompt: string,
     model: string,
+    signal?: AbortSignal,
   ): Promise<RiskAnalysis | null> {
     const bin = this.host.resolve();
     if (!bin) return null;
 
-    const run = (m: string): Promise<ExecResult> => {
-      this.logger.log(`runOneShotModel: calling ${bin} -p --model ${m} ...`);
-      return pi.exec(bin, [
-        "-p",
-        "--no-tools",
-        "--no-session",
-        "--no-lsp",
-        "--no-extensions",
-        "--no-skills",
-        "--no-rules",
-        "--no-title",
-        "--model", m,
-        prompt,
-      ], {
-        // Bounded wait: a hung remote model must not freeze the bash tool.
-        // On timeout the analysis degrades to rule-label confirmation.
-        // 0 = no timeout (legacy behavior).
-        ...(this.timeoutMs > 0 ? { timeout: this.timeoutMs } : {}),
+    // Lazy-spawn the persistent RPC child on first use.
+    this.rpc ??= new RpcModelInvoker(bin, this.logger);
+
+    const run = async (m: string): Promise<string | null> => {
+      this.logger.log(`runOneShotModel: rpc prompt model=${m}`);
+      return this.rpc!.prompt(m, prompt, {
+        timeoutMs: this.timeoutMs,
+        signal,
       });
     };
 
     try {
-      let result = await run(model);
+      let text = await run(model);
       // Fallback: if @smol role is unconfigured or the call failed
-      // (including timeout), retry with @default. Each run() call has its
+      // (including timeout), retry with @default. Each attempt has its
       // own bounded timeout, so the retry cannot hang indefinitely either.
-      if (result.code !== 0 && model === "@smol") {
-        this.logger.log(`runOneShotModel: @smol failed (exit ${result.code}), retrying with @default`);
-        result = await run("@default");
+      if (!text && model === "@smol") {
+        this.logger.log(`runOneShotModel: @smol failed, retrying with @default`);
+        text = await run("@default");
       }
 
-      if (result.code !== 0) {
-        this.logger.log(`runOneShotModel: exit code ${result.code}, stderr: ${(result.stderr || "").slice(0, 200)}`);
+      if (!text) {
+        this.logger.log("runOneShotModel: no output from model");
         return null;
       }
-      const parsed = extractJson(result.stdout || "");
+      const parsed = extractJson(text);
       if (!parsed) {
-        this.logger.log(`runOneShotModel: could not parse JSON from stdout (first 200 chars): ${(result.stdout || "").slice(0, 200)}`);
+        this.logger.log(`runOneShotModel: could not parse JSON from output (first 200 chars): ${text.slice(0, 200)}`);
       }
-      return parsed;
+      return parsed as RiskAnalysis | null;
     } catch (e) {
       this.logger.log(`runOneShotModel FAILED: ${e instanceof Error ? e.message : String(e)}`);
       return null;
     }
+  }
+
+  /** Shut down the persistent RPC child (session shutdown). */
+  dispose(): void {
+    this.rpc?.kill();
+    this.rpc = null;
   }
 
   /**
@@ -196,6 +195,7 @@ export class ModelInvoker {
     contextSection: string,
     t: I18n,
     model: string,
+    signal?: AbortSignal,
   ): Promise<RiskAnalysis | null> {
     const behaviorText = behaviorLabels.length > 0
       ? behaviorLabels.join("; ")
@@ -221,7 +221,7 @@ export class ModelInvoker {
       t.promptOnlyJson,
     ].join("\n");
 
-    return this.invoke(pi, prompt, model);
+    return this.invoke(pi, prompt, model, signal);
   }
 
 }

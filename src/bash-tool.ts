@@ -162,7 +162,7 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
           const behaviorLabels = analysis.labels.map((l) => l[lang] || l.en);
           logger.log(`bash-tool: analyzeRisk cmd="${cmd.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`);
           const result = await modelInvoker.analyze(
-            pi, cmd, behaviorLabels, contextSection, t, config.model,
+            pi, cmd, behaviorLabels, contextSection, t, config.model, signal,
           );
           analysisText = formatAnalysis(result, t);
           logger.log(`bash-tool: analysisText=${analysisText ? "OK" : "null"}`);
@@ -171,6 +171,15 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         } finally {
           ctx.ui.setStatus("smart-approve", undefined);
         }
+      }
+
+      // 6b. Interrupted while analyzing → abort, do not show the dialog.
+      if (signal?.aborted) {
+        logger.log("bash-tool: aborted during analysis");
+        return {
+          content: [{ type: "text", text: "(aborted)" }],
+          details: { aborted: true },
+        };
       }
 
       // 7. Approval dialog (no 30s timeout — inside execute(), not a handler)
@@ -194,6 +203,15 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         allowList.rememberSession("bash", cmd, effectiveCwd);
       } else if (decision.remember === "permanent") {
         allowList.rememberPermanent("bash", cmd, effectiveCwd);
+      }
+
+      // 7b. Interrupted after approval → do not execute.
+      if (signal?.aborted) {
+        logger.log("bash-tool: aborted after approval, not executing");
+        return {
+          content: [{ type: "text", text: "(aborted)" }],
+          details: { aborted: true },
+        };
       }
 
       // 8. Execute — delegate to native bash tool

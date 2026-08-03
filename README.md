@@ -20,8 +20,8 @@ LLM calls bash tool
               │ has UI:
               setStatus("analyzing…")
               gatherSessionContext() — original user task + recent agent plan
-              omp -p --model @smol (no timeout, runs to completion)
-                  @smol unconfigured? → retry with @default
+              RPC prompt → @smol (bounded by analysisTimeoutMs)
+                  @smol fails/times out? → retry with @default (also bounded)
                   success → dialog shows risk / summary / detail / recommendation
                   failure → dialog shows rule-based label only
               ctx.ui.select(title, [session allow, permanent allow, deny])
@@ -45,6 +45,23 @@ OMP's `EXTENSION_HANDLER_TIMEOUT_MS` (30s, hardcoded) wraps `tool_call` event ha
 
 The previous architecture intercepted bash via `pi.on("tool_call")` and was killed by the 30s timeout during LLM analysis. The custom tool architecture eliminates this entirely.
 
+## LLM risk analysis: persistent RPC session
+
+Risk analysis does **not** cold-start a new `omp -p` subprocess per call. Instead, the extension spawns **one** `omp --mode rpc` child on first use and reuses it over a JSONL stdio protocol for every analysis in the session:
+
+- **One process, many prompts** — extension loading (including `provider-retry-proxy`) and process startup are paid once per host session, not per analysis
+- **Per-attempt timeout** — each prompt is bounded by `analysisTimeoutMs` (default 30s, `0` = no timeout); a hung remote model cannot freeze the bash tool
+- **Model fallback** — `@smol` fails or times out → respawn with `@default` (also time-bounded) → rule-label confirmation
+- **Interruption** — the tool's `AbortSignal` is forwarded to the RPC child (`abort` command), so a user interrupt cancels an in-flight analysis instead of leaving it running
+- **Lifecycle** — the child is lazily spawned on first use, killed via `session_shutdown`, and exits on its own if the host dies (stdin EOF closes → process exits code 0, no orphans)
+
+The LLM receives:
+- **Session context** — original user task + recent agent plan (injection-guarded)
+- **Detected behaviors** — localized labels
+- **The command** — as-is
+
+And returns structured JSON: `risk` (low/medium/high), `summary`, `detail`, `recommend`.
+
 ## Features
 
 ### 1. Behavior-based detection (not just regex)
@@ -59,7 +76,7 @@ Parses git arguments to detect behaviors that regex alone misses:
 | `git reset --hard` | hard-reset | `--hard` flag |
 | `git worktree remove` | worktree-remove | subcommand parsing |
 
-Regex rules remain as a secondary net covering 30+ patterns: `rm -rf`, fork bombs, `curl|sh`, `mkfs`, `dd`, `kill -9`, `sudo`, `docker rm`, `kubectl delete`, 20+ git destructive operations, and more.
+Regex rules remain as a secondary net covering 30+ patterns: `rm -rf` (case-insensitive, including `-Rf`/`-RF` and `--recursive --force`), fork bombs, `curl|sh`, `mkfs`, `dd`, `kill -9`, `sudo`, `docker rm`, `kubectl delete`, 20+ git destructive operations, and more.
 
 ### 2. Protected path interception (write/edit)
 
@@ -87,18 +104,7 @@ The confirmation dialog offers three choices:
 
 Keys are scoped to `tool + normalized-content + cwd`, so the same command in a different project still triggers review. When the UI doesn't support `select`, it degrades to a simple `confirm` (two-way).
 
-### 4. LLM risk analysis (no timeout)
-
-The custom bash tool's `execute()` invokes the `@smol` model via the host binary's print mode (`omp -p --no-tools --no-session ...`). If `@smol` is unconfigured or fails, it automatically retries with `@default`. The subprocess runs to completion — no timeout is applied.
-
-The LLM receives:
-- **Session context** — original user task + recent agent plan (injection-guarded)
-- **Detected behaviors** — localized labels
-- **The command** — as-is
-
-And returns structured JSON: `risk` (low/medium/high), `summary`, `detail`, `recommend`.
-
-### 5. Session context for LLM review
+### 4. Session context for LLM review
 
 Reads the agent's conversation history via `ctx.sessionManager.getBranch()` / `getEntries()` and extracts:
 
@@ -107,7 +113,7 @@ Reads the agent's conversation history via `ctx.sessionManager.getBranch()` / `g
 
 All context is wrapped in `<untrusted_context>` blocks with injection guards. Tool outputs and tool-call arguments are explicitly excluded (largest injection surface). When `sessionManager` is unavailable, it safely degrades to `null` — LLM review still works, just without context.
 
-### 6. Hard-block behaviors
+### 5. Hard-block behaviors
 
 The following behaviors are **always hard-blocked** — no LLM review, no dialog, no allow-list override:
 
@@ -119,7 +125,7 @@ The following behaviors are **always hard-blocked** — no LLM review, no dialog
 - Disk format (`mkfs`, `dd` to block device)
 - Shutdown / reboot
 
-### 7. Execution via native bash tool delegation
+### 6. Execution via native bash tool delegation
 
 Commands are never executed directly by the extension. After passing the approval gate, execution is delegated to OMP's built-in bash tool via `ctx.invokeTool()`. This inherits all native behavior:
 
@@ -128,15 +134,15 @@ Commands are never executed directly by the extension. After passing the approva
 - **Env hardening** — `PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, etc.
 - **Output truncation** — head/tail windows with artifact spill
 - **Cross-platform** — no hardcoded binary paths
-### 8. OMP + pi dual compatibility with graceful degradation
 
+### 7. OMP + pi dual compatibility with graceful degradation
 
 | Aspect | Implementation |
 |---|---|
 | Dual manifest | `package.json` declares both `omp.extensions` and `pi.extensions` |
 | Host detection | `process.execPath` → `process.argv[1]` → PATH lookup (`omp` → `pi`) |
-| LLM invocation | `omp -p` or `pi -p`, flags shared by both |
-| Model fallback | `@smol` fails → retry `@default` → rule-only confirmation (no LLM) |
+| LLM invocation | Persistent `omp --mode rpc` / `pi --mode rpc` child, JSONL over stdio |
+| Model fallback | `@smol` fails/times out → retry `@default` → rule-only confirmation (no LLM) |
 | Headless | `ctx.hasUI === false` blocks all dangerous operations immediately |
 | Bilingual | zh/en, auto-adapts to locale (`LC_ALL` > `LC_MESSAGES` > `LANG` > macOS `AppleLocale`) |
 
@@ -146,7 +152,7 @@ Commands are never executed directly by the extension. After passing the approva
 npm install smart-approve
 ```
 
-Then configure OMP to load the extension and disable the built-in bash:
+Then configure OMP to load the extension:
 
 ```yaml
 # ~/.omp/agent/config.yml   (or ~/.pi/agent/config.yml for pi-agent)
@@ -159,7 +165,7 @@ tools:
 - `tools.approvalMode: yolo` — auto-approve safe commands; this extension is the sole gate for dangerous ones
 - `extensions: [smart-approve]` — load the extension from `node_modules`
 
-Restart the host after installing or editing.
+The custom "bash" tool shadows the built-in by name — no `bash.enabled` change is needed. Restart the host after installing or editing.
 
 ## Configuration
 
@@ -189,7 +195,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = rule-only confirmation |
 | `rememberDecisions` | `true` | Whether to offer session/permanent remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
-| `analysisTimeoutMs` | `30000` | Per-call timeout for the one-shot LLM analysis in ms; `0` = no timeout. On timeout, falls back to `@default` (also time-bounded) then rule-label confirmation |
+| `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure, falls back to `@default` (also time-bounded) then rule-label confirmation |
 | `model` | `@smol` | Model spec for risk analysis (role alias, provider/id, or bare id); falls back to `@default` if unavailable |
 
 ## Allow-list (decision memory)
@@ -218,7 +224,7 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 | `pi.registerTool({ name, parameters, execute })` | Register custom "bash" tool shadowing the built-in |
 | `pi.zod` | Injected zod module for tool parameter schemas |
 | `ctx.invokeTool(params, opts)` | Delegate execution to native bash tool |
-| `pi.exec(bin, ["-p", ...], opts)` | Spawn host binary for one-shot LLM risk analysis |
+| `child_process.spawn(hostBin, ["--mode", "rpc", ...])` | Persistent RPC child for LLM risk analysis |
 | `pi.on("tool_call", handler)` | Intercept `write`/`edit` on protected paths |
 | `ctx.hasUI` | Detect headless/subagent context |
 | `ctx.sessionManager.getBranch()` / `getEntries()` | Gather session context for LLM review |
@@ -232,13 +238,14 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 ```
 smart-approve/
 ├── README.md
-├── package.json          ← omp.extensions / pi.extensions manifest (v2.4.1)
+├── package.json          ← omp.extensions / pi.extensions manifest (v2.4.4)
 ├── LICENSE               ← MIT
 ├── src/
 │   ├── index.ts          ← SmartApprove orchestrator: register bash tool + write/edit hook
 │   ├── bash-tool.ts      ← custom "bash" tool (shadows built-in, delegates via ctx.invokeTool)
 │   ├── types.ts          ← ExtensionAPI, ToolDefinition, AgentToolResult, etc.
-│   ├── host.ts           ← HostResolver + ModelInvoker (one-shot LLM via host -p)
+│   ├── host.ts           ← HostResolver + ModelInvoker (persistent RPC LLM analysis)
+│   ├── rpc-invoker.ts    ← RPC client: spawn/reuse/kill omp --mode rpc child
 │   ├── behaviors.ts      ← behavior catalog, git parser, composite analysis
 │   ├── paths.ts          ← ProtectedPathMatcher (symlink-aware)
 │   ├── config.ts         ← ConfigStore
@@ -248,7 +255,7 @@ smart-approve/
 │   ├── i18n.ts           ← locale detection + bilingual strings (zh/en)
 │   └── logger.ts         ← Logger (file + stderr)
 └── dist/
-    └── index.js          ← bundled output (bun build, ~44KB)
+    └── index.js          ← bundled output (bun build, ~50KB)
 ```
 
 ### Runtime artifacts

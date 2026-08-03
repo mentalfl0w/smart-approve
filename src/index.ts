@@ -99,7 +99,8 @@ class SmartApprove {
     });
 
     this.pi.on("session_shutdown", async () => {
-      // Status is session-scoped; no cleanup needed
+      // Kill the persistent RPC model child so it does not outlive the session.
+      this.modelInvoker.dispose();
     });
   }
 
