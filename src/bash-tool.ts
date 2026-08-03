@@ -81,6 +81,9 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
         return { content: [{ type: "text", text: "(no command)" }] };
       }
 
+      // extractCwd is only for analysis (allowlist key, behavior detection).
+      // Execution delegates the RAW command so the native bash tool does
+      // its own cd extraction, cwd resolution, and path validation.
       const baseCwd = ctx.cwd || process.cwd();
       const { cmd, cwd: effectiveCwd } = extractCwd(rawCmd, baseCwd);
       const hasUI = ctx.hasUI;
@@ -88,8 +91,8 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
       logger.log(`bash-tool: cmd="${cmd.slice(0, 80)}" cwd=${effectiveCwd} hasUI=${hasUI}`);
 
       // Build params for native bash tool delegation
-      const nativeParams: Record<string, unknown> = { command: cmd };
-      if (effectiveCwd !== baseCwd) nativeParams.cwd = effectiveCwd;
+      const nativeParams: Record<string, unknown> = { command: rawCmd };
+      if (p.cwd) nativeParams.cwd = p.cwd;
       if (p.timeout) nativeParams.timeout = p.timeout;
 
       // Delegate execution to the native bash tool via ctx.invokeTool.
