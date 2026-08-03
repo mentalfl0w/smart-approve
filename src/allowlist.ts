@@ -65,8 +65,9 @@ export class AllowList {
   isAllowed(tool: string, content: string, cwd: string): boolean {
     const key = makeAllowKey(tool, content, cwd);
     if (this.sessionAllows.has(key)) return true;
+    const normalized = tool === "bash" ? normalize(content) : path.resolve(content);
     return this.permanent.some(
-      (e) => e.tool === tool && e.key === key.split("::")[1] && e.cwd === cwd,
+      (e) => e.tool === tool && e.key === normalized && e.cwd === cwd,
     );
   }
 

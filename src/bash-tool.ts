@@ -85,7 +85,10 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
       // Execution delegates the RAW command so the native bash tool does
       // its own cd extraction, cwd resolution, and path validation.
       const baseCwd = ctx.cwd || process.cwd();
-      const { cmd, cwd: effectiveCwd } = extractCwd(rawCmd, baseCwd);
+      const { cmd, cwd: extractedCwd } = extractCwd(rawCmd, baseCwd);
+      // Analysis cwd must match the real execution cwd: the cd-prefix path
+      // when one is present, else the explicit cwd param, else session cwd.
+      const effectiveCwd = extractedCwd !== baseCwd ? extractedCwd : p.cwd ?? baseCwd;
       const hasUI = ctx.hasUI;
 
       logger.log(`bash-tool: cmd="${cmd.slice(0, 80)}" cwd=${effectiveCwd} hasUI=${hasUI}`);
@@ -98,7 +101,19 @@ export function registerBashTool(pi: ExtensionAPI, deps: BashToolDeps): void {
       // Delegate execution to the native bash tool via ctx.invokeTool.
       // This avoids reimplementing shell path resolution, env hardening,
       // output truncation, and PTY — the native tool handles all of it.
-      const delegate = () => ctx.invokeTool!(nativeParams, { signal, onUpdate });
+      // invokeTool is only present when a native built-in of the same name
+      // exists; guard for hosts (e.g. older pi-agent) that lack it.
+      const delegate = () => {
+        if (!ctx.invokeTool) {
+          logger.log("bash-tool: ctx.invokeTool unavailable — cannot delegate");
+          return {
+            content: [{ type: "text", text: "Error: native bash tool delegation unavailable in this host" }],
+            details: { error: "invokeTool-unavailable" },
+            isError: true,
+          } as never;
+        }
+        return ctx.invokeTool(nativeParams, { signal, onUpdate });
+      };
 
       // 1. Allowlist hit → delegate directly
       if (config.rememberDecisions && allowList.isAllowed("bash", cmd, effectiveCwd)) {
