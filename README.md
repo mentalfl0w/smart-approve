@@ -53,7 +53,7 @@ Risk analysis does **not** cold-start a new `omp -p` subprocess per call. Instea
 - **Per-attempt timeout** — each prompt is bounded by `analysisTimeoutMs` (default 30s, `0` = no timeout); a hung remote model cannot freeze the bash tool
 - **Model fallback chain** — @tiny first (cheapest), then @smol, then @default; each attempt time-bounded; total failure degrades to rule-label confirmation
 - **Interruption** — the tool's `AbortSignal` is forwarded to the RPC child (`abort` command), so a user interrupt cancels an in-flight analysis instead of leaving it running
-- **Lifecycle** — the child is lazily spawned on first use, killed via `session_shutdown`, and exits on its own if the host dies (stdin EOF closes → process exits code 0, no orphans)
+- **Lifecycle** — the child is lazily spawned on first use, killed via `session_shutdown`, reaped after `rpcIdleTimeoutMs` (default 10 min) of inactivity, and exits on its own if the host dies (stdin EOF closes → process exits code 0, no orphans)
 
 The LLM receives:
 - **Session context** — original user task + recent agent plan (injection-guarded)
@@ -184,6 +184,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
   "rememberDecisions": true,
   "contextMaxChars": 3000,
   "analysisTimeoutMs": 30000,
+  "rpcIdleTimeoutMs": 600000,
   "model": "@tiny"
 }
 ```
@@ -196,6 +197,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `rememberDecisions` | `true` | Whether to offer session/permanent remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
 | `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure the model chain advances @tiny → @smol → @default, then rule-label confirmation |
+| `rpcIdleTimeoutMs` | `600000` | Idle lifetime of the persistent RPC child in ms; `0` = keep alive until session end. After this long without a prompt the child is killed (frees its memory) and lazily respawned on the next analysis |
 | `model` | `@tiny` | Model spec for risk analysis (role alias, provider/id, or bare id). Attempt chain: configured model runs first, then @tiny → @smol → @default as fallbacks (deduped) |
 
 ## Allow-list (decision memory)

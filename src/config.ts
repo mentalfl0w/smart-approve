@@ -25,6 +25,11 @@ export interface SmartApproveConfig {
   /** Timeout for the one-shot LLM risk analysis, in milliseconds.
    *  0 = no timeout (analysis can hang indefinitely). Default 30s. */
   analysisTimeoutMs: number;
+  /** Idle lifetime of the persistent RPC child, in milliseconds.
+   *  After this long without a prompt the child is killed (freed memory);
+   *  the next analysis lazily respawns it. 0 = keep alive until session end.
+   *  Default 10 minutes. */
+  rpcIdleTimeoutMs: number;
   /** Model spec for the one-shot risk analysis. Accepts any string the omp
    *  --model flag accepts: role alias (@tiny / @smol / @slow), provider/id,
    *  or bare id. Default @tiny — the cheapest role, first in the fallback
@@ -39,6 +44,7 @@ const DEFAULT_CONFIG: SmartApproveConfig = {
   rememberDecisions: true,
   contextMaxChars: 3000,
   analysisTimeoutMs: 30_000,
+  rpcIdleTimeoutMs: 600_000,
   model: "@tiny",
 };
 
@@ -55,6 +61,9 @@ function mergeConfig(user: unknown): SmartApproveConfig {
     analysisTimeoutMs: typeof u.analysisTimeoutMs === "number" && u.analysisTimeoutMs >= 0
       ? u.analysisTimeoutMs
       : DEFAULT_CONFIG.analysisTimeoutMs,
+    rpcIdleTimeoutMs: typeof u.rpcIdleTimeoutMs === "number" && u.rpcIdleTimeoutMs >= 0
+      ? u.rpcIdleTimeoutMs
+      : DEFAULT_CONFIG.rpcIdleTimeoutMs,
     model: typeof u.model === "string" && u.model.trim() ? u.model.trim() : DEFAULT_CONFIG.model,
   };
 }

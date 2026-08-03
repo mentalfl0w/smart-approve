@@ -123,13 +123,16 @@ export class ModelInvoker {
   private readonly host: HostResolver;
   private readonly logger: Logger;
   private readonly timeoutMs: number;
+  private readonly rpcIdleTimeoutMs: number;
   private rpc: RpcModelInvoker | null = null;
 
-  /** @param timeoutMs Bounded wait per model attempt (0 = no timeout). */
-  constructor(host: HostResolver, logger: Logger, timeoutMs: number) {
+  /** @param timeoutMs Bounded wait per model attempt (0 = no timeout).
+   *  @param rpcIdleTimeoutMs Reap the RPC child after this long idle (0 = keep alive). */
+  constructor(host: HostResolver, logger: Logger, timeoutMs: number, rpcIdleTimeoutMs: number) {
     this.host = host;
     this.logger = logger;
     this.timeoutMs = timeoutMs;
+    this.rpcIdleTimeoutMs = rpcIdleTimeoutMs;
   }
 
   /** Run the configured model on a prompt, parse JSON, return the analysis. */
@@ -142,7 +145,7 @@ export class ModelInvoker {
     if (!bin) return null;
 
     // Lazy-spawn the persistent RPC child on first use.
-    this.rpc ??= new RpcModelInvoker(bin, this.logger);
+    this.rpc ??= new RpcModelInvoker(bin, this.logger, this.rpcIdleTimeoutMs);
 
     const run = async (m: string): Promise<string | null> => {
       this.logger.log(`runOneShotModel: rpc prompt model=${m}`);

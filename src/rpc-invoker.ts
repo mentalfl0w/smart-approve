@@ -75,12 +75,16 @@ export class RpcModelInvoker {
   private seq = 0;
   private pending: PendingPrompt | null = null;
   private chain: Promise<string | null> = Promise.resolve(null);
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly bin: string;
   private readonly logger: Logger;
+  private readonly idleTimeoutMs: number;
 
-  constructor(bin: string, logger: Logger) {
+  /** @param idleTimeoutMs Reap the child after this long without prompts (0 = keep alive). */
+  constructor(bin: string, logger: Logger, idleTimeoutMs: number) {
     this.bin = bin;
     this.logger = logger;
+    this.idleTimeoutMs = idleTimeoutMs;
   }
 
   /** True when a spawn attempt has been made and the process is alive. */
@@ -98,8 +102,12 @@ export class RpcModelInvoker {
     return this.chain;
   }
 
-  /** Kill the child process (session shutdown or model switch). */
+  /** Kill the child process (session shutdown, model switch, or idle reap). */
   kill(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     if (this.proc && this.isAlive) {
       this.logger.log("rpc: killing model invoker process");
       this.proc.kill("SIGTERM");
@@ -129,6 +137,12 @@ export class RpcModelInvoker {
       await this.spawnPromise;
     }
 
+    // Cancel any pending idle reap — the child is active again.
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+
     const id = `sa-${++this.seq}`;
     this.logger.log(`rpc: prompt ${id} model=${model}`);
 
@@ -136,12 +150,23 @@ export class RpcModelInvoker {
     const pending: PendingPrompt = { resolve, timer: undefined };
     this.pending = pending;
 
+    // Reap the child after the idle window if no further prompt arrives.
     if (opts.timeoutMs > 0) {
       pending.timer = setTimeout(() => {
         this.logger.log(`rpc: prompt ${id} timed out after ${opts.timeoutMs}ms, aborting`);
         this.abort();
       }, opts.timeoutMs);
     }
+
+    promise.finally(() => {
+      // Prompt settled — arm the idle reaper for the next quiet window.
+      if (this.idleTimeoutMs > 0) {
+        this.idleTimer = setTimeout(() => {
+          this.logger.log(`rpc: idle ${this.idleTimeoutMs}ms, reaping child`);
+          this.kill();
+        }, this.idleTimeoutMs);
+      }
+    });
 
     const onAbort = () => {
       this.logger.log(`rpc: prompt ${id} aborted by signal`);
