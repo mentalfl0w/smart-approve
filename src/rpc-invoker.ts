@@ -200,10 +200,12 @@ export class RpcModelInvoker {
       "--no-title",
       "--no-prewalk",
       "--no-pty",
+      "--no-extensions",
       "--thinking=off",
       "--max-time=300",
     ], {
       stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, PI_MEMORY_BACKEND: "off" },
     });
     this.proc = proc;
     this.currentModel = model;
