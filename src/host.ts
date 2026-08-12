@@ -13,6 +13,7 @@ import type { RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
 import { RpcModelInvoker } from "./rpc-invoker";
+import { analysisModelChain } from "./analysis-policy";
 
 /** Extract JSON object from model output (handles ```json fences and bare JSON). */
 function extractJson(text: string): RiskAnalysis | null {
@@ -156,10 +157,7 @@ export class ModelInvoker {
     };
 
     try {
-      // Attempt chain: configured model first (default @tiny), then the
-      // standard fallbacks @tiny -> @smol -> @default, deduped. So the
-      // default config yields @tiny -> @smol -> @default.
-      const chain = [...new Set([model, "@tiny", "@smol", "@default"])];
+      const chain = analysisModelChain(model);
 
       let text: string | null = null;
       for (const m of chain) {
@@ -167,6 +165,11 @@ export class ModelInvoker {
         text = await run(m);
         if (text) break;
         this.logger.log(`runOneShotModel: ${m} failed, trying next in chain`);
+      }
+      if (!text && !signal?.aborted) {
+        this.logger.log(`runOneShotModel: ${model} empty, retrying on a new child`);
+        this.rpc!.kill();
+        text = await run(model);
       }
 
       if (!text) {

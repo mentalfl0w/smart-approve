@@ -24,7 +24,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "bun build src/index.ts --outdir dist --target bun",
-    "dev": "bun run src/index.ts"
+    "dev": "bun run src/index.ts",
+    "test": "node --experimental-strip-types --test src/analysis-policy.test.ts"
   },
   "omp": {
     "extensions": [

@@ -21,6 +21,12 @@
 import * as child_process from "node:child_process";
 import * as readline from "node:readline";
 import type { Logger } from "./logger";
+import {
+  enqueueSerialized,
+  shouldClearProcRef,
+  shouldReuseRpcChild,
+  shouldSettleAgentEnd,
+} from "./analysis-policy";
 
 interface RpcFrame {
   type: string;
@@ -98,7 +104,7 @@ export class RpcModelInvoker {
     signal?: AbortSignal;
   }): Promise<string | null> {
     // Serialize prompts: one analysis at a time over the shared connection.
-    this.chain = this.chain.then(() => this.runPrompt(model, promptText, opts));
+    this.chain = enqueueSerialized(this.chain, () => this.runPrompt(model, promptText, opts));
     return this.chain;
   }
 
@@ -128,10 +134,10 @@ export class RpcModelInvoker {
   ): Promise<string | null> {
     if (opts.signal?.aborted) return null;
 
-    // Ensure the child runs with the requested model; respawn on spec change.
-    // (When the model matches and the child is healthy, reuse it as-is.)
-    if (model !== this.currentModel || !this.isAlive) {
-      this.logger.log(`rpc: model change ${this.currentModel ?? "(none)"} -> ${model}, restarting`);
+    // Fresh child per analysis: a reused --no-session RPC child returns
+    // an empty agent_end on the second prompt.
+    if (!shouldReuseRpcChild(model, this.currentModel, this.isAlive)) {
+      this.logger.log(`rpc: fresh child for ${model}`);
       this.kill();
       this.spawnPromise = this.spawn(model);
       await this.spawnPromise;
@@ -242,19 +248,23 @@ export class RpcModelInvoker {
 
     proc.on("error", (err) => {
       this.logger.log(`rpc: spawn error: ${err.message}`);
-      this.proc = null;
-      this.rl = null;
-      this.spawnPromise = null;
+      if (shouldClearProcRef(this.proc, proc)) {
+        this.proc = null;
+        this.rl = null;
+        this.spawnPromise = null;
+      }
       if (!ready) reject(err);
       else this.failPending(`process error: ${err.message}`);
     });
     proc.on("exit", (code, signal) => {
       this.logger.log(`rpc: process exited code=${code} signal=${signal} stderr=${stderrBuf.slice(-500)}`);
-      this.proc = null;
-      this.rl = null;
-      this.spawnPromise = null;
-      if (!ready) reject(new Error(`rpc process exited before ready (code ${code})`));
-      else this.failPending(`process exited (code ${code})`);
+      if (shouldClearProcRef(this.proc, proc)) {
+        this.proc = null;
+        this.rl = null;
+        this.spawnPromise = null;
+        if (!ready) reject(new Error(`rpc process exited before ready (code ${code})`));
+        else this.failPending(`process exited (code ${code})`);
+      }
     });
     return promise;
   }
@@ -270,6 +280,10 @@ export class RpcModelInvoker {
         break;
       }
       case "agent_end": {
+        if (!shouldSettleAgentEnd(frame)) {
+          this.logger.log("rpc: ignoring non-terminal agent_end");
+          break;
+        }
         const text = lastAssistantText(frame.messages);
         if (!text.trim()) {
           this.logger.log("rpc: agent_end with no assistant text");
