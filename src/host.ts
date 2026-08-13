@@ -13,6 +13,7 @@ import type { RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
 import { RpcModelInvoker } from "./rpc-invoker";
+import { shouldRetryFresh } from "./analysis-policy";
 
 /** Extract JSON object from model output (handles ```json fences and bare JSON). */
 function extractJson(text: string): RiskAnalysis | null {
@@ -156,16 +157,36 @@ export class ModelInvoker {
     };
 
     try {
-      // Attempt chain: configured model first (default @tiny), then the
-      // standard fallbacks @tiny -> @smol -> @default, deduped. So the
-      // default config yields @tiny -> @smol -> @default.
+      // Attempt chain: configured model first, then the standard fallbacks
+      // @tiny -> @smol -> @default, deduped. A spec that cannot spawn (e.g.
+      // a role alias absent from the host's modelRoles) fails fast and is
+      // skipped; a rejected spawn must not abort the whole analysis.
       const chain = [...new Set([model, "@tiny", "@smol", "@default"])];
 
       let text: string | null = null;
       for (const m of chain) {
         if (signal?.aborted) break;
-        text = await run(m);
+        try {
+          text = await run(m);
+        } catch (e) {
+          this.logger.log(`runOneShotModel: ${m} spawn failed (${e instanceof Error ? e.message : String(e)}), skipping`);
+          continue;
+        }
         if (text) break;
+        // First attempt returned no text — a reused --no-session child can
+        // settle without assistant text. Retry the configured model once on
+        // a fresh child before falling through the chain.
+        if (m === model && shouldRetryFresh(text, signal?.aborted === true)) {
+          this.logger.log(`runOneShotModel: ${m} returned no text, retrying on a fresh child`);
+          this.rpc!.kill();
+          try {
+            text = await run(m);
+          } catch (e) {
+            this.logger.log(`runOneShotModel: ${m} fresh-child retry failed (${e instanceof Error ? e.message : String(e)})`);
+            text = null;
+          }
+          if (text) break;
+        }
         this.logger.log(`runOneShotModel: ${m} failed, trying next in chain`);
       }
 

@@ -21,6 +21,12 @@
 import * as child_process from "node:child_process";
 import * as readline from "node:readline";
 import type { Logger } from "./logger";
+import {
+  enqueueSerialized,
+  extractAssistantText,
+  shouldClearProcRef,
+  shouldSettleAgentEnd,
+} from "./analysis-policy";
 
 interface RpcFrame {
   type: string;
@@ -33,38 +39,12 @@ interface RpcFrame {
   [k: string]: unknown;
 }
 
-/** Concatenate text blocks from an RPC message content array. */
-function messageText(msg: unknown): string {
-  if (!msg || typeof msg !== "object") return "";
-  const c = (msg as Record<string, unknown>).content;
-  if (typeof c === "string") return c;
-  if (!Array.isArray(c)) return "";
-  const parts: string[] = [];
-  for (const block of c) {
-    if (block && typeof block === "object" && "type" in block && "text" in block) {
-      const b = block as Record<string, unknown>;
-      if (b.type === "text" && typeof b.text === "string") parts.push(b.text);
-    }
-  }
-  return parts.join("");
-}
-
-/** Last assistant text from an agent_end messages array. */
-function lastAssistantText(messages: unknown): string {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m && typeof m === "object" && (m as Record<string, unknown>).role === "assistant") {
-      const t = messageText(m);
-      if (t.trim()) return t;
-    }
-  }
-  return "";
-}
-
 interface PendingPrompt {
   resolve: (text: string | null) => void;
   timer: ReturnType<typeof setTimeout> | undefined;
+  /** Accumulated text_delta deltas from message_update frames, used when
+   *  agent_end.messages carries no assistant text. */
+  deltaBuffer: string;
 }
 
 export class RpcModelInvoker {
@@ -98,7 +78,8 @@ export class RpcModelInvoker {
     signal?: AbortSignal;
   }): Promise<string | null> {
     // Serialize prompts: one analysis at a time over the shared connection.
-    this.chain = this.chain.then(() => this.runPrompt(model, promptText, opts));
+    // A rejected prior spawn must not poison this prompt.
+    this.chain = enqueueSerialized(this.chain, () => this.runPrompt(model, promptText, opts));
     return this.chain;
   }
 
@@ -129,7 +110,8 @@ export class RpcModelInvoker {
     if (opts.signal?.aborted) return null;
 
     // Ensure the child runs with the requested model; respawn on spec change.
-    // (When the model matches and the child is healthy, reuse it as-is.)
+    // (When the model matches and the child is healthy, reuse it as-is —
+    // extension loading and startup are paid once per host session.)
     if (model !== this.currentModel || !this.isAlive) {
       this.logger.log(`rpc: model change ${this.currentModel ?? "(none)"} -> ${model}, restarting`);
       this.kill();
@@ -147,7 +129,7 @@ export class RpcModelInvoker {
     this.logger.log(`rpc: prompt ${id} model=${model}`);
 
     const { promise, resolve } = Promise.withResolvers<string | null>();
-    const pending: PendingPrompt = { resolve, timer: undefined };
+    const pending: PendingPrompt = { resolve, timer: undefined, deltaBuffer: "" };
     this.pending = pending;
 
     // Reap the child after the idle window if no further prompt arrives.
@@ -242,19 +224,23 @@ export class RpcModelInvoker {
 
     proc.on("error", (err) => {
       this.logger.log(`rpc: spawn error: ${err.message}`);
-      this.proc = null;
-      this.rl = null;
-      this.spawnPromise = null;
+      if (shouldClearProcRef(this.proc, proc)) {
+        this.proc = null;
+        this.rl = null;
+        this.spawnPromise = null;
+      }
       if (!ready) reject(err);
       else this.failPending(`process error: ${err.message}`);
     });
     proc.on("exit", (code, signal) => {
       this.logger.log(`rpc: process exited code=${code} signal=${signal} stderr=${stderrBuf.slice(-500)}`);
-      this.proc = null;
-      this.rl = null;
-      this.spawnPromise = null;
-      if (!ready) reject(new Error(`rpc process exited before ready (code ${code})`));
-      else this.failPending(`process exited (code ${code})`);
+      if (shouldClearProcRef(this.proc, proc)) {
+        this.proc = null;
+        this.rl = null;
+        this.spawnPromise = null;
+        if (!ready) reject(new Error(`rpc process exited before ready (code ${code})`));
+        else this.failPending(`process exited (code ${code})`);
+      }
     });
     return promise;
   }
@@ -263,18 +249,47 @@ export class RpcModelInvoker {
   private handleFrame(frame: RpcFrame): void {
     switch (frame.type) {
       case "response": {
-        if (frame.command === "prompt" && frame.success !== true) {
-          this.logger.log(`rpc: prompt rejected: ${frame.error}`);
-          this.settle(null);
+        if (frame.command === "prompt") {
+          const agentInvoked = (frame.data as { agentInvoked?: boolean } | undefined)?.agentInvoked;
+          if (agentInvoked === false) {
+            // Local-only completion: no agent turn will start, so no
+            // agent_end will arrive. Settle now instead of waiting out
+            // the timeout.
+            this.logger.log("rpc: prompt resolved locally (agentInvoked=false)");
+            this.settle(null);
+          } else if (frame.success !== true) {
+            this.logger.log(`rpc: prompt rejected: ${frame.error}`);
+            this.settle(null);
+          }
+        }
+        break;
+      }
+      case "message_update": {
+        // Accumulate streaming text deltas so an agent_end with an empty
+        // messages array (the canonical protocol shape) still yields text.
+        const ev = (frame as { assistantMessageEvent?: { type?: string; delta?: string } }).assistantMessageEvent;
+        if (ev?.type === "text_delta" && typeof ev.delta === "string" && this.pending) {
+          this.pending.deltaBuffer += ev.delta;
         }
         break;
       }
       case "agent_end": {
-        const text = lastAssistantText(frame.messages);
-        if (!text.trim()) {
+        if (!shouldSettleAgentEnd({ isTerminal: frame.isTerminal })) {
+          this.logger.log("rpc: ignoring non-terminal agent_end");
+          break;
+        }
+        const text = extractAssistantText(frame.messages, this.pending?.deltaBuffer ?? "");
+        if (!text) {
           this.logger.log("rpc: agent_end with no assistant text");
         }
-        this.settle(text.trim() || null);
+        this.settle(text || null);
+        break;
+      }
+      case "prompt_result": {
+        if ((frame as { agentInvoked?: boolean }).agentInvoked === false) {
+          this.logger.log("rpc: prompt resolved locally (prompt_result)");
+          this.settle(null);
+        }
         break;
       }
       case "extension_error":
