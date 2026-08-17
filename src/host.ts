@@ -213,13 +213,14 @@ export class ModelInvoker {
 
   /**
    * Build the risk-analysis prompt from a pre-formatted context section,
-   * behavior labels, and the command, then invoke the model.
+   * behavior labels, and the subject (command or code), then invoke the model.
    *
    * The caller formats session context (via SessionContextGatherer.format)
    * so this method stays focused on prompt assembly + invocation.
    */
   async analyze(
-    cmd: string,
+    subject: string,
+    subjectLabel: string,
     behaviorLabels: string[],
     contextSection: string,
     t: I18n,
@@ -238,8 +239,8 @@ export class ModelInvoker {
       `=== ${t.promptRule} ===`,
       behaviorText,
       "",
-      `=== ${t.promptCommand} ===`,
-      cmd,
+      `=== ${subjectLabel} ===`,
+      subject,
       "",
       t.promptOutput,
       '- risk: "low" | "medium" | "high"',
@@ -252,5 +253,5 @@ export class ModelInvoker {
 
     return this.invoke(prompt, model, signal);
   }
-
 }
+

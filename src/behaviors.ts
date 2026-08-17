@@ -55,6 +55,8 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
   "kubectl-delete": makeLabel("kubectl delete", "kubectl delete"),
   "mv-sys-dir": makeLabel("Move system directory", "移动系统目录"),
   "cp-root": makeLabel("Recursive copy to root", "递归拷贝到根"),
+  "git-force-push-protected": makeLabel("git force push to protected branch", "git 强制推送到保护分支"),
+  "delete-home": makeLabel("Delete home directory (~)", "删除家目录 ~"),
 };
 
 // ── Regex danger rules (secondary net) ──────────────────────────────
@@ -151,6 +153,10 @@ const DANGER_RULES: Array<{ pattern: RegExp; behavior: string }> = [
   // — Filesystem operations —
   { pattern: /\bmv\b.*\s\/(?:usr|etc|var|bin)\b/, behavior: "mv-sys-dir" },
   { pattern: /\bcp\s+-r\b.*\s\/\s*$/, behavior: "cp-root" },
+  // — Home directory deletion (deny tier) —
+  { pattern: /(?:^|[\s;&|])rm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+(?:~|\$HOME)(?=$|[\s;&|])/i,
+    behavior: "delete-home" },
+  { pattern: /\brm\s+-rf\s+\/Users\/[^\s/;|&]+/i, behavior: "delete-home" },
 ];
 
 // ── Git argument parser ──────────────────────────────────────────────
@@ -210,6 +216,27 @@ function isForcePush(args: string[]): boolean {
   return false;
 }
 
+/** Branches whose force push is deny-tier (regex-confident without AI). */
+const PROTECTED_PUSH_BRANCHES: Record<string, true> = {
+  main: true, master: true, production: true, prod: true, release: true, trunk: true,
+};
+
+/** Extract candidate remote branch names from push args (refspecs). */
+function pushTargetBranches(args: string[]): string[] {
+  const branches: string[] = [];
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (arg.startsWith("-")) continue;
+    let target = arg;
+    if (target.includes(":")) target = target.slice(target.lastIndexOf(":") + 1);
+    if (target.startsWith("+")) target = target.slice(1);
+    // Keep only the leaf: refs/heads/main -> main, origin/main -> main.
+    target = target.slice(target.lastIndexOf("/") + 1);
+    if (target) branches.push(target);
+  }
+  return branches;
+}
+
 function isBranchDelete(args: string[]): boolean {
   for (const arg of args) {
     if (arg === "--") break;
@@ -241,8 +268,14 @@ function analyzeGit(args: string[]): string[] {
   if (!skipped) return [];
   const { subcommand, rest } = skipped;
   switch (subcommand) {
-    case "push":
-      return isForcePush(rest) ? ["git-force-push"] : [];
+    case "push": {
+      if (!isForcePush(rest)) return [];
+      const ids = ["git-force-push"];
+      if (pushTargetBranches(rest).some((b) => PROTECTED_PUSH_BRANCHES[b] === true)) {
+        ids.push("git-force-push-protected");
+      }
+      return ids;
+    }
     case "branch":
       return isBranchDelete(rest) ? ["git-branch-delete"] : [];
     case "worktree":
@@ -259,15 +292,22 @@ function analyzeGit(args: string[]): string[] {
 // ── Composite analysis ───────────────────────────────────────────────
 
 /** Behaviors that are always hard-blocked (no LLM review, no allow). */
-const HARD_BLOCK_BEHAVIORS = new Set([
-  "delete-root",
-  "fork-bomb",
-  "remote-fetch-exec",
-  "write-sensitive-file",
-  "write-block-device",
-  "disk-format",
-  "shutdown-reboot",
-]);
+const HARD_BLOCK_BEHAVIORS: Record<string, true> = {
+  "delete-root": true,
+  "fork-bomb": true,
+  "remote-fetch-exec": true,
+  "write-sensitive-file": true,
+  "write-block-device": true,
+  "disk-format": true,
+  "shutdown-reboot": true,
+};
+
+/** Deny-tier behaviors: regex-confident enough to block without an LLM
+ *  verdict when auto mode falls back to regex-only decisions. */
+const DENY_TIER_BEHAVIORS: Record<string, true> = {
+  "git-force-push-protected": true,
+  "delete-home": true,
+};
 
 /** Normalize command for stable regex matching. */
 export function normalize(cmd: string): string {
@@ -299,7 +339,8 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
 
   const behaviors = [...behaviorSet];
   const labels = behaviors.map((b) => BEHAVIORS[b] || makeLabel(b, b));
-  const hardBlocked = behaviors.some((b) => HARD_BLOCK_BEHAVIORS.has(b));
+  const hardBlocked = behaviors.some((b) => b in HARD_BLOCK_BEHAVIORS);
+  const denyTier = behaviors.some((b) => b in DENY_TIER_BEHAVIORS);
 
-  return { behaviors, labels, hardBlocked };
+  return { behaviors, labels, hardBlocked, denyTier };
 }

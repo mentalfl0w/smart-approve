@@ -1,7 +1,7 @@
 {
   "name": "smart-approve",
   "description": "High-risk-only approval hook with LLM risk analysis, behavior detection, protected-path interception, and decision memory for oh-my-pi (OMP) and pi-agent.",
-  "version": "2.5.5",
+  "version": "2.6.0",
   "files": [
     "dist"
   ],
@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit",
     "build": "bun build src/index.ts --outdir dist --target bun",
     "dev": "bun run src/index.ts",
-    "test": "node --test src/analysis-policy.test.ts"
+    "test": "bun test src"
   },
   "omp": {
     "extensions": [

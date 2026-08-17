@@ -11,7 +11,7 @@
 
 import type { ExtensionCtx, SessionContext } from "./types";
 import type { I18n } from "./i18n";
-import type { Logger } from "./logger";
+import type { LoggerLike } from "./logger";
 
 /** Strip ANSI escape codes and control characters from text. */
 function stripAnsi(input: string): string {
@@ -50,7 +50,7 @@ function extractMessageText(msg: unknown): string | null {
  * Reads ctx.sessionManager, returns compact excerpts for the LLM prompt.
  */
 export class SessionContextGatherer {
-  constructor(private readonly logger?: Logger) {}
+  constructor(private readonly logger?: LoggerLike) {}
 
   /**
    * Gather session context from ctx.sessionManager.

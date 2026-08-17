@@ -15,16 +15,22 @@ export interface I18nLang {
   detail: string;
   recommend: string;
   command: string;
+  code: string;
   filePath: string;
   allowPrompt: string;
   analysisUnavailable: string;
   blockedNoUI: (label: string) => string;
   blockedPathNoUI: (p: string) => string;
   userDenied: (label: string) => string;
+  autoBlocked: (label: string) => string;
+  autoAllowed: (label: string) => string;
+  modeSwitched: (mode: string) => string;
+  cmdHelp: string;
   promptIntro: string;
   promptContext: string;
   promptRule: string;
   promptCommand: string;
+  promptCode: string;
   promptOutput: string;
   promptSummaryDesc: string;
   promptDetailDesc: string;
@@ -50,16 +56,22 @@ const I18N: Record<Lang, I18nLang> = {
     detail: "详情",
     recommend: "建议",
     command: "命令",
+    code: "代码",
     filePath: "文件",
-    analysisUnavailable: "（模型分析不可用）",
     allowPrompt: "是否允许执行？",
+    analysisUnavailable: "（模型分析不可用）",
     blockedNoUI: (label) => `[smart-approve] 高危命令被拦截（无 UI 无法确认）: ${label}`,
     blockedPathNoUI: (p) => `[smart-approve] 敏感路径写入被拦截（无 UI 无法确认）: ${p}`,
     userDenied: (label) => `[smart-approve] 用户拒绝: ${label}`,
+    autoBlocked: (label) => `[smart-approve] 已自动拦截: ${label}`,
+    autoAllowed: (label) => `[smart-approve] 已自动放行: ${label}`,
+    modeSwitched: (mode) => `[smart-approve] 已切换到 ${mode === "auto" ? "auto 模式（AI 自动裁决，不再弹窗）" : "interactive 模式（危险操作弹窗确认）"}`,
+    cmdHelp: "用法: /smart-approve auto | interactive | status（无参数时切换模式）",
     promptIntro: "你是 shell 命令风险分析器。分析下面这条命令，给出风险评估。",
     promptContext: "会话上下文",
     promptRule: "检测到的行为",
     promptCommand: "命令",
+    promptCode: "代码",
     promptOutput: "输出 JSON，字段:",
     promptSummaryDesc: "一句话中文总结命令在做什么",
     promptDetailDesc: "中文，50字内说明风险点和注意事项",
@@ -80,16 +92,22 @@ const I18N: Record<Lang, I18nLang> = {
     detail: "Detail",
     recommend: "Recommendation",
     command: "Command",
+    code: "Code",
     filePath: "File",
-    analysisUnavailable: "(model analysis unavailable)",
     allowPrompt: "Allow execution?",
+    analysisUnavailable: "(model analysis unavailable)",
     blockedNoUI: (label) => `[smart-approve] Dangerous command blocked (no UI to confirm): ${label}`,
     blockedPathNoUI: (p) => `[smart-approve] Protected path write blocked (no UI to confirm): ${p}`,
     userDenied: (label) => `[smart-approve] User denied: ${label}`,
+    autoBlocked: (label) => `[smart-approve] Auto-blocked: ${label}`,
+    autoAllowed: (label) => `[smart-approve] Auto-allowed: ${label}`,
+    modeSwitched: (mode) => `[smart-approve] Switched to ${mode === "auto" ? "auto mode (AI decides, no dialogs)" : "interactive mode (dialogs for dangerous ops)"}`,
+    cmdHelp: "Usage: /smart-approve auto | interactive | status (no args toggles the mode)",
     promptIntro: "You are a shell command risk analyzer. Analyze the following command and provide a risk assessment.",
     promptContext: "Session context",
     promptRule: "Detected behaviors",
     promptCommand: "Command",
+    promptCode: "Code",
     promptOutput: "Output JSON with fields:",
     promptSummaryDesc: "One sentence summarizing what the command does",
     promptDetailDesc: "Within 50 words, explain risk points and precautions",

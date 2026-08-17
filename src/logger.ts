@@ -15,7 +15,12 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { RotatingLog } from "./utils/rotating-log.js";
 
-export class Logger {
+/** Minimal logger contract for dependency injection (tests, stubs). */
+export interface LoggerLike {
+  log(message: string): void;
+}
+
+export class Logger implements LoggerLike {
   private readonly rotatingLog: RotatingLog;
 
   constructor(logDir?: string) {

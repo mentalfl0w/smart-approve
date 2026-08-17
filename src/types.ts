@@ -12,11 +12,19 @@
 /** The pi/omp extension API surface used by this extension. */
 export interface ExtensionAPI {
   on(
-    event: "tool_call" | "session_shutdown",
+    event: "tool_call" | "session_start" | "session_shutdown",
     handler: (
       event: ToolCallEvent,
       ctx: ExtensionCtx,
     ) => Promise<void | { block: true; reason: string }>,
+  ): void;
+  /** Register a slash command callable from the TUI/RPC host. */
+  registerCommand(
+    name: string,
+    def: {
+      description: string;
+      handler: (args: unknown, ctx: ExtensionCtx) => void | Promise<void>;
+    },
   ): void;
   /** Execute a shell command. */
   exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
@@ -52,6 +60,7 @@ export interface ToolDefinition<TParams = unknown, TDetails = unknown> {
   approval?: string;
   deferrable?: boolean;
   hidden?: boolean;
+  strict?: boolean;
   execute(
     toolCallId: string,
     params: TParams,
@@ -99,6 +108,21 @@ export interface ExtensionCtx {
 
 }
 
+/** Minimal chainable zod surface used by gate tool schemas. */
+export interface ZodFieldBuilder {
+  describe(text: string): ZodFieldBuilder;
+  optional(): ZodFieldBuilder;
+}
+
+/** The host-injected zod builder, narrowed to what gates need. */
+export interface ZodLike {
+  object(spec: Record<string, unknown>): unknown;
+  string(): ZodFieldBuilder;
+  number(): ZodFieldBuilder;
+  boolean(): ZodFieldBuilder;
+  enum(values: readonly string[]): unknown;
+}
+
 // ── Domain value objects ─────────────────────────────────────────────
 
 /** Model analysis result from the smol LLM. */
@@ -121,6 +145,9 @@ export interface DangerAnalysis {
   behaviors: string[];
   /** Localized labels for display. */
   labels: { en: string; zh: string }[];
+  /** True if any matched behavior is in the deny tier (regex-confident,
+   *  blocks when auto mode has no LLM verdict and fallback is "regex"). */
+  denyTier: boolean;
   /** True if any matched behavior is in the hard-block set. */
   hardBlocked: boolean;
 }
