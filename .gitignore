@@ -10,6 +10,8 @@
 
 # Dependencies
 node_modules/
+bun.lock
+package-lock.json
 
 # Build output
 dist/
