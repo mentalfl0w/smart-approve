@@ -36,18 +36,16 @@ export interface SmartApproveConfig {
   rememberDecisions: boolean;
   /** Max characters of session context to feed the LLM. */
   contextMaxChars: number;
-  /** Timeout for the one-shot LLM risk analysis, in milliseconds.
-   *  0 = no timeout (analysis can hang indefinitely). Default 30s. */
+  /** Chat: timeout per RPC attempt. Native decisions: total analysis deadline.
+   *  0 = no plugin deadline; provider limits still apply. Default 30s. */
   analysisTimeoutMs: number;
   /** Idle lifetime of the persistent RPC child, in milliseconds.
    *  After this long without a prompt the child is killed (freed memory);
    *  the next analysis lazily respawns it. 0 = keep alive until session end.
    *  Default 10 minutes. */
   rpcIdleTimeoutMs: number;
-  /** Model spec for the one-shot risk analysis. Accepts any string the omp
-   *  --model flag accepts: role alias (@tiny / @smol / @slow), provider/id,
-   *  or bare id. Default @tiny — the cheapest role, first in the fallback
-   *  chain @tiny -> @smol -> @default. */
+  /** Chat role alias/provider/id, or an exact provider/model-id registered as
+   *  a Pi classifier or OMP native judgment model. Default @tiny. */
   model: string;
 }
 

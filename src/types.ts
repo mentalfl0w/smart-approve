@@ -6,6 +6,8 @@
  * every other module can import the contracts it needs without pulling in
  * side-effecting state.
  */
+import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
+
 
 // ── Extension API surface (minimal; no host import) ──────────────────
 
@@ -84,10 +86,27 @@ export interface ToolCallEvent {
   input: { command?: string; path?: string; [k: string]: unknown };
 }
 
+/** Optional model registry surface; Pi and OMP provide different capabilities. */
+export interface HostModelRegistry {
+  getModelOfType?: (type: "classifier", provider: string, modelId: string) => unknown;
+  classify?: (
+    model: unknown,
+    context: unknown,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ) => Promise<unknown>;
+  find?: (provider: string, modelId: string) => Model<Api> | undefined;
+  resolver?: (model: Model<Api>) => ApiKey;
+  resolveModelHeaders?: (
+    model: Model<Api>,
+    signal?: AbortSignal,
+  ) => Promise<Record<string, string> | undefined>;
+}
+
 export interface ExtensionCtx {
   hasUI: boolean;
   cwd?: string;
   lang?: string;
+  modelRegistry?: HostModelRegistry;
   sessionManager?: {
     getBranch?: () => unknown[];
     getEntries?: () => unknown[];
