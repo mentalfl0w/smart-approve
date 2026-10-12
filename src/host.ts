@@ -1,19 +1,21 @@
 /**
- * Smart Approve — host resolution + one-shot LLM invocation.
+ * Smart Approve — chat and host-native model adapters.
  *
- * Resolves the host binary path (the process that launched this extension)
- * and drives the smol model through a persistent RPC child for risk
- * analysis.  All diagnostic detail flows through the Logger so failures
- * are traceable end-to-end.
+ * Chat models use a persistent RPC child. Registered Pi classifiers and OMP
+ * judges use their host model registries and native request APIs.
  */
 
 import * as fs from "node:fs";
 import { execSync } from "node:child_process";
-import type { RiskAnalysis } from "./types";
+import type { ExtensionCtx, RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
 import { RpcModelInvoker } from "./rpc-invoker";
 import { shouldRetryFresh } from "./analysis-policy";
+import { NativeDecisionProtocol } from "./native-decision-protocol";
+import { OmpNativeJudgeDecisionAdapter } from "./omp-native-judge-adapter";
+import { PiClassifierDecisionAdapter } from "./pi-classifier-adapter";
+import type { OmpNativeJudgmentSupportLoader } from "./omp-native-judge-adapter";
 
 /** Extract JSON object from model output (handles ```json fences and bare JSON). */
 function extractJson(text: string): RiskAnalysis | null {
@@ -111,14 +113,11 @@ export class HostResolver {
 }
 
 /**
- * Runs one-shot model invocations through a persistent `omp --mode rpc`
- * child (see RpcModelInvoker).
+ * Routes registered native decision models to their host API and chat models
+ * to the persistent `omp --mode rpc` fallback chain.
  *
- * The model spec comes from SmartApproveConfig (defaulting to @smol).
- * Each attempt is bounded by analysisTimeoutMs; a hung remote model
- * degrades to rule-label confirmation instead of hanging. In the custom
- * tool's execute() path there is no 30s pressure. If @smol is
- * unconfigured, falls back to @default automatically.
+ * Native model failures return no verdict; interactive confirmation and
+ * autoFallback remain owned by ToolGate and AutoDecisionPolicy.
  */
 export class ModelInvoker {
   private readonly host: HostResolver;
@@ -126,14 +125,30 @@ export class ModelInvoker {
   private readonly timeoutMs: number;
   private readonly rpcIdleTimeoutMs: number;
   private rpc: RpcModelInvoker | null = null;
+  private readonly piClassifierAdapter: PiClassifierDecisionAdapter;
+  private readonly ompNativeJudgeAdapter: OmpNativeJudgeDecisionAdapter;
 
   /** @param timeoutMs Bounded wait per model attempt (0 = no timeout).
    *  @param rpcIdleTimeoutMs Reap the RPC child after this long idle (0 = keep alive). */
-  constructor(host: HostResolver, logger: Logger, timeoutMs: number, rpcIdleTimeoutMs: number) {
+  constructor(
+    host: HostResolver,
+    logger: Logger,
+    timeoutMs: number,
+    rpcIdleTimeoutMs: number,
+    ompSupportLoader?: OmpNativeJudgmentSupportLoader,
+  ) {
     this.host = host;
     this.logger = logger;
     this.timeoutMs = timeoutMs;
     this.rpcIdleTimeoutMs = rpcIdleTimeoutMs;
+    const nativeProtocol = new NativeDecisionProtocol();
+    this.piClassifierAdapter = new PiClassifierDecisionAdapter(nativeProtocol, timeoutMs, logger);
+    this.ompNativeJudgeAdapter = new OmpNativeJudgeDecisionAdapter(
+      nativeProtocol,
+      timeoutMs,
+      logger,
+      ompSupportLoader,
+    );
   }
 
   /** Run the configured model on a prompt, parse JSON, return the analysis. */
@@ -211,13 +226,7 @@ export class ModelInvoker {
     this.rpc = null;
   }
 
-  /**
-   * Build the risk-analysis prompt from a pre-formatted context section,
-   * behavior labels, and the subject (command or code), then invoke the model.
-   *
-   * The caller formats session context (via SessionContextGatherer.format)
-   * so this method stays focused on prompt assembly + invocation.
-   */
+  /** Analyze one command or code block using the selected host model. */
   async analyze(
     subject: string,
     subjectLabel: string,
@@ -226,7 +235,21 @@ export class ModelInvoker {
     t: I18n,
     model: string,
     signal?: AbortSignal,
+    ctx?: ExtensionCtx,
   ): Promise<RiskAnalysis | null> {
+    if (ctx?.modelRegistry) {
+      const input = { subject, subjectLabel, behaviorLabels, contextSection };
+      const piAttempt = await this.piClassifierAdapter.tryAnalyze(
+        ctx.modelRegistry, model, input, t, signal,
+      );
+      if (piAttempt.matched) return piAttempt.analysis;
+
+      const ompAttempt = await this.ompNativeJudgeAdapter.tryAnalyze(
+        ctx.modelRegistry, model, input, t, signal,
+      );
+      if (ompAttempt.matched) return ompAttempt.analysis;
+    }
+
     const behaviorText = behaviorLabels.length > 0
       ? behaviorLabels.join("; ")
       : "none detected";
