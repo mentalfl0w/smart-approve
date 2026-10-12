@@ -59,3 +59,67 @@ test("Pi classifier errors do not produce an approval result", async () => {
     { matched: true, analysis: null },
   );
 });
+
+test("Pi classifier lookup errors leave the model unmatched", async () => {
+  const adapter = new PiClassifierDecisionAdapter(new NativeDecisionProtocol(), 1_000, silentLogger);
+  const registry = {
+    getModelOfType() {
+      throw new Error("registry unavailable");
+    },
+  };
+
+  assert.deepEqual(
+    await adapter.tryAnalyze(registry, "typesafe/jev-latest", input, translations),
+    { matched: false },
+  );
+});
+
+test("Pi registered classifiers without classify() return no verdict", async () => {
+  const adapter = new PiClassifierDecisionAdapter(new NativeDecisionProtocol(), 1_000, silentLogger);
+  const registry = { getModelOfType: () => ({ id: "jev-latest" }) };
+
+  assert.deepEqual(
+    await adapter.tryAnalyze(registry, "typesafe/jev-latest", input, translations),
+    { matched: true, analysis: null },
+  );
+});
+
+test("Pi classifier request rejection returns no verdict", async () => {
+  const adapter = new PiClassifierDecisionAdapter(new NativeDecisionProtocol(), 1_000, silentLogger);
+  const registry = {
+    getModelOfType: () => ({ id: "jev-latest" }),
+    classify: async () => {
+      throw new Error("provider request failed");
+    },
+  };
+
+  assert.deepEqual(
+    await adapter.tryAnalyze(registry, "typesafe/jev-latest", input, translations),
+    { matched: true, analysis: null },
+  );
+});
+
+test("Pi classifier cancellation aborts the underlying request", async () => {
+  const pendingClassification = Promise.withResolvers<unknown>();
+  let requestSignal: AbortSignal | undefined;
+  const registry = {
+    getModelOfType: () => ({ id: "jev-latest" }),
+    classify: async (_model: unknown, _context: unknown, options?: { signal?: AbortSignal }) => {
+      requestSignal = options?.signal;
+      return pendingClassification.promise;
+    },
+  };
+  const adapter = new PiClassifierDecisionAdapter(new NativeDecisionProtocol(), 0, silentLogger);
+  const controller = new AbortController();
+  const pending = adapter.tryAnalyze(
+    registry,
+    "typesafe/jev-latest",
+    input,
+    translations,
+    controller.signal,
+  );
+  controller.abort();
+
+  assert.deepEqual(await pending, { matched: true, analysis: null });
+  assert.equal(requestSignal?.aborted, true);
+});
