@@ -42,7 +42,7 @@ test("risk high blocks even when recommend says allow (conflict resolves stricte
   const highAllow = nativeAnalysis("high", "allow");
   assert.ok(highAllow);
   assert.equal(p.decide(highAllow, false).verdict, "block");
-  assert.equal(p.decide(nativeAnalysis("high", "deny"), false).verdict, "block");
+  assert.equal(p.decide({ risk: "high" }, false).verdict, "block");
 });
 
 test("risk medium blocks only when autoBlockRisk is medium", () => {
