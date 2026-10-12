@@ -1,17 +1,17 @@
 /**
- * Smart Approve — host resolution + one-shot LLM invocation.
+ * Smart Approve — host resolution + one-shot model analysis.
  *
- * Resolves the host binary path (the process that launched this extension)
- * and drives the smol model through a persistent RPC child for risk
- * analysis.  All diagnostic detail flows through the Logger so failures
- * are traceable end-to-end.
+ * Chat analysis runs through a persistent RPC child. Supported native
+ * Decisions models use the host's structured judgment API.
  */
 
 import * as fs from "node:fs";
 import { execSync } from "node:child_process";
-import type { RiskAnalysis } from "./types";
+import type { ExtensionCtx, JudgmentModel, RiskAnalysis } from "./types";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
+import { analyzeNativeDecision } from "./native-decisions";
+import type { NativeDecisionInput } from "./native-decisions";
 import { RpcModelInvoker } from "./rpc-invoker";
 import { shouldRetryFresh } from "./analysis-policy";
 
@@ -111,14 +111,12 @@ export class HostResolver {
 }
 
 /**
- * Runs one-shot model invocations through a persistent `omp --mode rpc`
- * child (see RpcModelInvoker).
+ * Runs one-shot risk analyses: supported native Decisions models use the
+ * host judge API, while chat models use a persistent `omp --mode rpc` child.
  *
  * The model spec comes from SmartApproveConfig (defaulting to @smol).
- * Each attempt is bounded by analysisTimeoutMs; a hung remote model
- * degrades to rule-label confirmation instead of hanging. In the custom
- * tool's execute() path there is no 30s pressure. If @smol is
- * unconfigured, falls back to @default automatically.
+ * Native attempts and individual chat attempts are bounded by
+ * analysisTimeoutMs; failures degrade to the existing chat/rule fallbacks.
  */
 export class ModelInvoker {
   private readonly host: HostResolver;
@@ -142,6 +140,43 @@ export class ModelInvoker {
     model: string,
     signal?: AbortSignal,
   ): Promise<RiskAnalysis | null> {
+    return this.invokeChat(prompt, model, signal, false);
+  }
+
+  private resolveAvailableModel(selector: string, ctx?: ExtensionCtx): JudgmentModel | undefined {
+    const registry = ctx?.modelRegistry;
+    if (!registry?.getAvailable) return undefined;
+
+    try {
+      let selected: JudgmentModel | undefined;
+      const separator = selector.indexOf("/");
+      for (const candidate of registry.getAvailable("all")) {
+        const qualifiedMatch = separator === candidate.provider.length
+          && selector.startsWith(candidate.provider)
+          && selector.charCodeAt(separator) === 47
+          && selector.length === separator + 1 + candidate.id.length
+          && selector.startsWith(candidate.id, separator + 1);
+        if (candidate.id !== selector && !qualifiedMatch) continue;
+        if (selected) return undefined;
+        selected = candidate;
+      }
+      return selected;
+    } catch (e) {
+      this.logger.log(`native judgment model lookup failed: ${e instanceof Error ? e.message : String(e)}`);
+      return undefined;
+    }
+  }
+
+  private isJudgeModel(model: JudgmentModel): boolean {
+    return model.kind === "judge" || model.api === "openrouter-decisions";
+  }
+
+  private async invokeChat(
+    prompt: string,
+    model: string,
+    signal: AbortSignal | undefined,
+    skipConfiguredModel: boolean,
+  ): Promise<RiskAnalysis | null> {
     const bin = this.host.resolve();
     if (!bin) return null;
 
@@ -157,11 +192,11 @@ export class ModelInvoker {
     };
 
     try {
-      // Attempt chain: configured model first, then the standard fallbacks
-      // @tiny -> @smol -> @default, deduped. A spec that cannot spawn (e.g.
-      // a role alias absent from the host's modelRoles) fails fast and is
-      // skipped; a rejected spawn must not abort the whole analysis.
-      const chain = [...new Set([model, "@tiny", "@smol", "@default"])];
+      // Chat keeps its configured-model-first chain; a recognized judge skips
+      // the selected model and uses only the existing chat fallbacks.
+      const chain = skipConfiguredModel
+        ? ["@tiny", "@smol", "@default"]
+        : [...new Set([model, "@tiny", "@smol", "@default"])];
 
       let text: string | null = null;
       for (const m of chain) {
@@ -176,7 +211,7 @@ export class ModelInvoker {
         // First attempt returned no text — a reused --no-session child can
         // settle without assistant text. Retry the configured model once on
         // a fresh child before falling through the chain.
-        if (m === model && shouldRetryFresh(text, signal?.aborted === true)) {
+        if (!skipConfiguredModel && m === model && shouldRetryFresh(text, signal?.aborted === true)) {
           this.logger.log(`runOneShotModel: ${m} returned no text, retrying on a fresh child`);
           this.rpc!.kill();
           try {
@@ -226,7 +261,28 @@ export class ModelInvoker {
     t: I18n,
     model: string,
     signal?: AbortSignal,
+    ctx?: ExtensionCtx,
   ): Promise<RiskAnalysis | null> {
+    const selectedModel = this.resolveAvailableModel(model, ctx);
+    const skipConfiguredModel = selectedModel !== undefined && this.isJudgeModel(selectedModel);
+
+    if (selectedModel?.api === "openrouter-decisions" && ctx?.modelRegistry) {
+      const nativeInput: NativeDecisionInput = { subject, subjectLabel, behaviorLabels, contextSection };
+      try {
+        const nativeResult = await analyzeNativeDecision(
+          ctx.modelRegistry,
+          selectedModel,
+          nativeInput,
+          this.timeoutMs,
+          this.logger,
+          signal,
+        );
+        if (nativeResult) return nativeResult;
+      } catch (e) {
+        this.logger.log(`native judgment failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (signal?.aborted) return null;
+    }
     const behaviorText = behaviorLabels.length > 0
       ? behaviorLabels.join("; ")
       : "none detected";
@@ -251,7 +307,7 @@ export class ModelInvoker {
       t.promptOnlyJson,
     ].join("\n");
 
-    return this.invoke(prompt, model, signal);
+    return this.invokeChat(prompt, model, signal, skipConfiguredModel);
   }
 }
 

@@ -92,9 +92,9 @@ SmartApprove (orchestrator)
 
 `ToolGate` defines the invariant flow (hard-block → allow-list → no-behavior → headless → verdict → remember → delegate); each concrete gate implements three hooks — `analyze()` / `buildKey()` / `delegate()` — plus its schema and subject extraction. Adding a new covered tool means adding one subclass, not touching the pipeline. Collaborators are injected as narrow interfaces (`AllowListLike`, `ModelInvokerLike`, `LoggerLike`), so the branch matrix is unit-testable without a running host.
 
-## LLM risk analysis: persistent RPC session
+## Chat-model risk analysis: persistent RPC session
 
-Risk analysis does **not** cold-start a new `omp -p` subprocess per call. Instead, the extension spawns **one** `omp --mode rpc` child on first use and reuses it over a JSONL stdio protocol for every analysis in the session:
+For chat models, risk analysis does **not** cold-start a new `omp -p` subprocess per call. Instead, the extension spawns **one** `omp --mode rpc` child on first use and reuses it over a JSONL stdio protocol for every analysis in the session:
 
 - **One process, many prompts** — extension loading (including `provider-retry-proxy`) and process startup are paid once per host session, not per analysis
 - **Per-attempt timeout** — each prompt is bounded by `analysisTimeoutMs` (default 30s, `0` = no timeout); a hung remote model cannot freeze the covered tools
@@ -254,9 +254,25 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = rule-only |
 | `rememberDecisions` | `true` | Whether to offer remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
-| `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure the model chain advances @tiny → @smol → @default, then falls back per mode |
+| `analysisTimeoutMs` | `30000` | Per-attempt timeout for risk analysis in ms; `0` = no extension timeout. On timeout/failure the model chain advances @tiny → @smol → @default, then falls back per mode |
 | `rpcIdleTimeoutMs` | `600000` | Idle lifetime of the persistent RPC child in ms; `0` = keep alive until session end |
 | `model` | `@tiny` | Model spec for risk analysis (role alias, provider/id, or bare id) |
+
+### OpenRouter Decisions approval model (OMP)
+
+OpenRouter's `openai/gpt-6-luna-decisions` assesses an operation by answering structured questions, not a chat prompt. On OMP, Smart Approve asks it to choose a risk level (`low`/`medium`/`high`) and a recommendation (`allow`/`deny`), then applies the existing approval policy. Decisions results do not include the written summary/detail supplied by chat models.
+
+If native judgment is unavailable, fails, or returns invalid choices, Smart Approve tries the existing chat fallbacks (@tiny → @smol → @default). If all attempts fail, interactive mode still asks you; auto mode uses `autoFallback`. Its default `"regex"` permits review-tier operations but blocks deny-tier operations; `"block"` blocks every reviewable operation. Hard blocks and headless restrictions remain unchanged.
+
+With OpenRouter credentials configured and the model available in OMP's registry, set the existing approval-model field in `~/.omp/agent/smart-approve.json`:
+
+```json
+{
+  "model": "openrouter/openai/gpt-6-luna-decisions"
+}
+```
+
+Verified with OMP 18.10.0. OMP supplies model metadata, credential resolution, headers, and its native judgment API; no separate endpoint or API key is configured here. The host AI module is loaded only for a native judgment attempt. Existing chat configurations and Pi's chat path are unchanged.
 
 ## Allow-list (decision memory)
 
@@ -284,7 +300,9 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 | `pi.registerTool({ name, parameters, execute })` | Custom "bash"/"eval" tools shadowing the built-ins |
 | `pi.zod` | Injected zod module for tool parameter schemas |
 | `ctx.invokeTool(params, opts)` | Delegate execution to the native tool of the same name |
-| `child_process.spawn(hostBin, ["--mode", "rpc", ...])` | Persistent RPC child for LLM risk analysis |
+| `child_process.spawn(hostBin, ["--mode", "rpc", ...])` | Persistent RPC child for chat-model risk analysis |
+| `ctx.modelRegistry.getAvailable("all") / resolver() / resolveModelHeaders()` | Optional OMP native-model selection and request authentication |
+| `createNativeJudge` via OMP's legacy `@mariozechner/pi-ai` module compatibility | Structured OpenRouter Decisions requests; loaded lazily |
 | `pi.on("tool_call", handler)` | hub launch gating + write/edit protected-path interception |
 | `pi.on("session_start" / "session_shutdown")` | Status chip / RPC child cleanup |
 | `pi.registerCommand("smart-approve", …)` | Runtime mode switching + status |
@@ -311,8 +329,10 @@ smart-approve/
 │   ├── eval-analyzer.ts  ← EvalCodeBehaviorAnalyzer (subprocess intent)
 │   ├── hub-guard.ts      ← HubLaunchGuard (hub op:"start" regex rules)
 │   ├── types.ts          ← ExtensionAPI, ToolDefinition, DangerAnalysis, …
-│   ├── host.ts           ← HostResolver + ModelInvoker (persistent RPC)
+│   ├── host.ts           ← HostResolver + ModelInvoker (chat/native dispatch)
 │   ├── rpc-invoker.ts    ← RPC client: spawn/reuse/kill omp --mode rpc child
+│   ├── native-decisions.ts ← structured choice questions + bounded OMP judgment
+│   ├── mariozechner-pi-ai.d.ts ← optional host-provided AI export contract
 │   ├── paths.ts          ← ProtectedPathMatcher (symlink-aware)
 │   ├── config.ts         ← ConfigStore (load / update / persist)
 │   ├── allowlist.ts      ← AllowList (session + permanent)

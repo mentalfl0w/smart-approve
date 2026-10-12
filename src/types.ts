@@ -1,8 +1,8 @@
 /**
  * Smart Approve — type definitions.
  *
- * Extension API surface, tool-call event/ctx shapes, and the risk-analysis
- * result contract returned by the smol LLM.  Kept free of runtime code so
+ * Extension API surface, tool-call event/ctx shapes, and the shared risk-analysis
+ * result contract consumed by the existing approval policy. Kept free of runtime code so
  * every other module can import the contracts it needs without pulling in
  * side-effecting state.
  */
@@ -84,10 +84,34 @@ export interface ToolCallEvent {
   input: { command?: string; path?: string; [k: string]: unknown };
 }
 
+/** Minimal OMP model metadata needed for exact native-judge selection. */
+export interface JudgmentModel {
+  id: string;
+  provider: string;
+  api: string;
+  kind?: string;
+}
+
+export type JudgmentApiKey =
+  | string
+  | ((options?: { signal?: AbortSignal }) => Promise<string | undefined>);
+
+/** Optional OMP model-registry methods used only for native judgments. */
+export interface JudgmentModelRegistry {
+  getAvailable?: (kind: "all") => readonly JudgmentModel[];
+  resolver?: (model: JudgmentModel, sessionId?: string) => JudgmentApiKey | undefined;
+  resolveModelHeaders?: (
+    model: JudgmentModel,
+    signal?: AbortSignal,
+  ) => Promise<Record<string, string> | undefined>;
+}
+
 export interface ExtensionCtx {
   hasUI: boolean;
   cwd?: string;
   lang?: string;
+  /** Optional OMP registry; Pi continues to use its existing chat invocation. */
+  modelRegistry?: JudgmentModelRegistry;
   sessionManager?: {
     getBranch?: () => unknown[];
     getEntries?: () => unknown[];
@@ -125,7 +149,7 @@ export interface ZodLike {
 
 // ── Domain value objects ─────────────────────────────────────────────
 
-/** Model analysis result from the smol LLM. */
+/** Model analysis result consumed by the existing approval policy. */
 export interface RiskAnalysis {
   risk?: string;
   summary?: string;

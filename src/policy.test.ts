@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { AutoDecisionPolicy } from "./policy.ts";
+import { parseNativeAnswers } from "./native-decisions.ts";
 import type { SmartApproveConfig } from "./config.ts";
 
 function makeConfig(overrides: Partial<SmartApproveConfig> = {}): SmartApproveConfig {
@@ -22,27 +23,35 @@ function makeConfig(overrides: Partial<SmartApproveConfig> = {}): SmartApproveCo
   };
 }
 
+function nativeAnalysis(risk: "low" | "medium" | "high", recommend: "allow" | "deny") {
+  return parseNativeAnswers({
+    risk: { type: "choice", choice: risk },
+    recommend: { type: "choice", choice: recommend },
+  });
+}
+
 test("recommend deny blocks regardless of risk", () => {
   const p = new AutoDecisionPolicy(makeConfig());
-  const d = p.decide({ risk: "low", recommend: "deny" }, false);
+  const d = p.decide(nativeAnalysis("low", "deny"), false);
   assert.equal(d.verdict, "block");
   assert.equal(d.reason, "ai-recommend");
 });
 
 test("risk high blocks even when recommend says allow (conflict resolves stricter)", () => {
   const p = new AutoDecisionPolicy(makeConfig());
-  assert.equal(p.decide({ risk: "high", recommend: "allow" }, false).verdict, "block");
-  assert.equal(p.decide({ risk: "high" }, false).verdict, "block");
+  const highAllow = nativeAnalysis("high", "allow");
+  assert.ok(highAllow);
+  assert.equal(p.decide(highAllow, false).verdict, "block");
+  assert.equal(p.decide(nativeAnalysis("high", "deny"), false).verdict, "block");
 });
 
 test("risk medium blocks only when autoBlockRisk is medium", () => {
-  assert.equal(
-    new AutoDecisionPolicy(makeConfig()).decide({ risk: "medium" }, false).verdict,
-    "allow",
-  );
+  const mediumAllow = nativeAnalysis("medium", "allow");
+  assert.ok(mediumAllow);
+  assert.equal(new AutoDecisionPolicy(makeConfig()).decide(mediumAllow, false).verdict, "allow");
   assert.equal(
     new AutoDecisionPolicy(makeConfig({ autoBlockRisk: "medium" }))
-      .decide({ risk: "medium" }, false).verdict,
+      .decide(mediumAllow, false).verdict,
     "block",
   );
 });

@@ -23,7 +23,7 @@
   "author": "",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/index.ts --outdir dist --target bun",
+    "build": "bun build src/index.ts --outdir dist --target bun --external @mariozechner/pi-ai",
     "dev": "bun run src/index.ts",
     "test": "bun test src"
   },

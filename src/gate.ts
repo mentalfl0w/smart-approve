@@ -49,6 +49,7 @@ export interface ModelInvokerLike {
     t: I18n,
     model: string,
     signal?: AbortSignal,
+    ctx?: ExtensionCtx,
   ): Promise<RiskAnalysis | null>;
 }
 
@@ -196,7 +197,7 @@ export abstract class ToolGate {
         const behaviorLabels = analysis.labels.map((l) => l[lang] || l.en);
         logger.log(`${this.toolName}: analyzeRisk subject="${subject.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`);
         aiResult = await modelInvoker.analyze(
-          subject, this.promptSubjectLabel(), behaviorLabels, contextSection, t, config.model, signal,
+          subject, this.promptSubjectLabel(), behaviorLabels, contextSection, t, config.model, signal, ctx,
         );
         analysisText = formatAnalysis(aiResult, t);
         logger.log(`${this.toolName}: analysisText=${analysisText ? "OK" : "null"}`);

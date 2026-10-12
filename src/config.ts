@@ -30,7 +30,7 @@ export interface SmartApproveConfig {
   coverage: { eval: boolean };
   /** Protected path glob patterns for write/edit interception. */
   protectedPaths: string[];
-  /** Whether to run LLM risk analysis (requires host binary). */
+  /** Whether to run model risk analysis (chat RPC or OMP native judgment). */
   llmAnalysis: boolean;
   /** Whether to remember decisions. */
   rememberDecisions: boolean;
@@ -44,10 +44,9 @@ export interface SmartApproveConfig {
    *  the next analysis lazily respawns it. 0 = keep alive until session end.
    *  Default 10 minutes. */
   rpcIdleTimeoutMs: number;
-  /** Model spec for the one-shot risk analysis. Accepts any string the omp
-   *  --model flag accepts: role alias (@tiny / @smol / @slow), provider/id,
-   *  or bare id. Default @tiny — the cheapest role, first in the fallback
-   *  chain @tiny -> @smol -> @default. */
+  /** Approval model selector: chat role alias/provider/id/bare id, or an
+   *  exact OpenRouter Decisions provider/id or bare id available in OMP.
+   *  Default @tiny — first in the chat fallback chain @tiny -> @smol -> @default. */
   model: string;
 }
 
