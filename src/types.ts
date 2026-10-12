@@ -6,6 +6,23 @@
  * every other module can import the contracts it needs without pulling in
  * side-effecting state.
  */
+import type { Api, ApiKey, Judge, Model, NativeJudgeConnection } from "@oh-my-pi/pi-ai";
+
+/** OMP-only capabilities; generic Pi entry has no runtime host imports. */
+export interface NativeJudgmentSupport {
+  isJudgmentApi(api: Api): boolean;
+  createNativeJudge(model: Model, connection: NativeJudgeConnection): Judge;
+}
+
+/** Registry subset used only when an OMP judgment model is selected. */
+export interface JudgmentModelRegistry {
+  find(provider: string, modelId: string): Model | undefined;
+  getApiKeyAndHeaders(model: Model): Promise<
+    | { ok: true; apiKey?: ApiKey; headers?: Record<string, string> }
+    | { ok: false; error: string }
+  >;
+  resolveModelHeaders(model: Model, signal?: AbortSignal): Promise<Record<string, string> | undefined>;
+}
 
 // ── Extension API surface (minimal; no host import) ──────────────────
 
@@ -88,6 +105,8 @@ export interface ExtensionCtx {
   hasUI: boolean;
   cwd?: string;
   lang?: string;
+  /** Optional OMP registry; Pi keeps using its existing chat invocation. */
+  modelRegistry?: JudgmentModelRegistry;
   sessionManager?: {
     getBranch?: () => unknown[];
     getEntries?: () => unknown[];

@@ -9,9 +9,12 @@
 
 import * as fs from "node:fs";
 import { execSync } from "node:child_process";
-import type { RiskAnalysis } from "./types";
+import type { JudgmentModelRegistry, NativeJudgmentSupport, RiskAnalysis } from "./types";
+import type { Model } from "@oh-my-pi/pi-ai";
 import type { I18n } from "./i18n";
 import type { Logger } from "./logger";
+import { analyzeNativeDecision } from "./native-decisions";
+import type { NativeDecisionInput } from "./native-decisions";
 import { RpcModelInvoker } from "./rpc-invoker";
 import { shouldRetryFresh } from "./analysis-policy";
 
@@ -126,14 +129,22 @@ export class ModelInvoker {
   private readonly timeoutMs: number;
   private readonly rpcIdleTimeoutMs: number;
   private rpc: RpcModelInvoker | null = null;
+  private readonly nativeJudgmentSupport?: NativeJudgmentSupport;
 
   /** @param timeoutMs Bounded wait per model attempt (0 = no timeout).
    *  @param rpcIdleTimeoutMs Reap the RPC child after this long idle (0 = keep alive). */
-  constructor(host: HostResolver, logger: Logger, timeoutMs: number, rpcIdleTimeoutMs: number) {
+  constructor(
+    host: HostResolver,
+    logger: Logger,
+    timeoutMs: number,
+    rpcIdleTimeoutMs: number,
+    nativeJudgmentSupport?: NativeJudgmentSupport,
+  ) {
     this.host = host;
     this.logger = logger;
     this.timeoutMs = timeoutMs;
     this.rpcIdleTimeoutMs = rpcIdleTimeoutMs;
+    this.nativeJudgmentSupport = nativeJudgmentSupport;
   }
 
   /** Run the configured model on a prompt, parse JSON, return the analysis. */
@@ -226,7 +237,49 @@ export class ModelInvoker {
     t: I18n,
     model: string,
     signal?: AbortSignal,
+    registry?: JudgmentModelRegistry,
   ): Promise<RiskAnalysis | null> {
+    if (this.nativeJudgmentSupport && registry) {
+      const separator = model.indexOf("/");
+      if (separator > 0 && separator < model.length - 1) {
+        const provider = model.slice(0, separator);
+        const modelId = model.slice(separator + 1);
+        let registeredModel: Model | undefined;
+        try {
+          registeredModel = registry.find(provider, modelId);
+        } catch (e) {
+          this.logger.log(`native judgment model lookup failed: ${e instanceof Error ? e.message : String(e)}`);
+          return null;
+        }
+        if (registeredModel) {
+          let isNativeJudgment: boolean;
+          try {
+            isNativeJudgment = this.nativeJudgmentSupport.isJudgmentApi(registeredModel.api);
+          } catch (e) {
+            this.logger.log(`native judgment API lookup failed: ${e instanceof Error ? e.message : String(e)}`);
+            return null;
+          }
+          if (isNativeJudgment) {
+            const input: NativeDecisionInput = { subject, subjectLabel, behaviorLabels, contextSection };
+            try {
+              return await analyzeNativeDecision(
+                this.nativeJudgmentSupport,
+                registry,
+                registeredModel,
+                input,
+                this.timeoutMs,
+                this.logger,
+                signal,
+              );
+            } catch (e) {
+              this.logger.log(`native judgment failed: ${e instanceof Error ? e.message : String(e)}`);
+              return null;
+            }
+          }
+        }
+      }
+    }
+
     const behaviorText = behaviorLabels.length > 0
       ? behaviorLabels.join("; ")
       : "none detected";

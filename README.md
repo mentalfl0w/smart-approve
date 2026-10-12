@@ -247,16 +247,36 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `enabled` | `true` | Master switch |
 | `mode` | `"interactive"` | `"interactive"` (dialogs) or `"auto"` (AI decides, no dialogs). Switchable at runtime via `/smart-approve` |
 | `autoBlockRisk` | `"high"` | Auto mode: AI risk at or above this level blocks (`"high"` or `"medium"`) |
-| `autoFallback` | `"regex"` | Auto mode when the LLM chain fails: `"regex"` (hard-block + deny tier still block, rest executes) or `"block"` (everything reviewable blocks) |
+| `autoFallback` | `"regex"` | Auto mode without a valid model verdict: `"regex"` (hard-block + deny tier still block, rest executes) or `"block"` (everything reviewable blocks) |
 | `autoInHeadless` | `false` | Auto mode also applies in headless/subagent sessions (AI decides instead of blanket block) |
 | `coverage.eval` | `true` | Shadow the `eval` tool; set `false` on hosts without a native eval tool |
 | `protectedPaths` | 20+ built-in patterns | Glob patterns for write/edit interception; `!` prefix negates |
 | `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = rule-only |
 | `rememberDecisions` | `true` | Whether to offer remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
-| `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure the model chain advances @tiny → @smol → @default, then falls back per mode |
+| `analysisTimeoutMs` | `30000` | Chat: per-attempt RPC timeout; failures advance through the fallback chain. Native judgment: deadline for the entire analysis, including credentials. `0` disables the plugin timeout; provider limits still apply |
 | `rpcIdleTimeoutMs` | `600000` | Idle lifetime of the persistent RPC child in ms; `0` = keep alive until session end |
 | `model` | `@tiny` | Model spec for risk analysis (role alias, provider/id, or bare id) |
+
+### Selecting a safety model
+
+Chat models keep using a persistent child session and the existing fallback chain: the configured model, then `@tiny`, `@smol`, and `@default` (duplicates skipped). Role aliases and bare model ids keep that behavior on both hosts.
+
+On OMP 18.10.0 or newer, a fully qualified `provider/model-id` also lets Smart Approve look up the model's API in OMP's registry. Registered judgment models, such as OpenRouter Decisions, receive structured questions about risk and whether to allow the command. The request uses the registry's model metadata, credentials, and headers. There is no separate protocol setting and no chat fallback once a judgment model is selected. Pi's entry remains chat-only and does not load OMP's AI package.
+
+Native answers must include valid risk and recommendation choices with consistent probability distributions. Missing credentials, refusals, invalid answers, provider errors, and timeouts produce no verdict. In interactive mode the existing confirmation dialog remains; in auto mode `autoFallback` decides whether a command awaiting review can run. Cancellation stops the tool without executing it.
+
+The default `"regex"` fallback can let reviewable commands proceed without an AI verdict if they do not match the deny tier. Use `"block"` to reject every command awaiting model review when no valid verdict is available. For example, this OMP configuration selects Decisions and blocks on analysis failure:
+
+```json
+{
+  "model": "openrouter/openai/gpt-6-luna-decisions",
+  "mode": "auto",
+  "autoFallback": "block"
+}
+```
+
+The existing hard blocks, remembered approvals, and headless rules still apply before model analysis. Set `autoInHeadless` to `true` only if you also want AI decisions in headless sessions; its default remains `false`.
 
 ## Allow-list (decision memory)
 
@@ -285,6 +305,7 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 | `pi.zod` | Injected zod module for tool parameter schemas |
 | `ctx.invokeTool(params, opts)` | Delegate execution to the native tool of the same name |
 | `child_process.spawn(hostBin, ["--mode", "rpc", ...])` | Persistent RPC child for LLM risk analysis |
+| `ctx.modelRegistry` / `createNativeJudge` | OMP-only model lookup and native judgment requests |
 | `pi.on("tool_call", handler)` | hub launch gating + write/edit protected-path interception |
 | `pi.on("session_start" / "session_shutdown")` | Status chip / RPC child cleanup |
 | `pi.registerCommand("smart-approve", …)` | Runtime mode switching + status |
@@ -302,6 +323,8 @@ smart-approve/
 ├── LICENSE               ← MIT
 ├── src/
 │   ├── index.ts          ← SmartApprove orchestrator: wiring + commands + hooks
+│   ├── omp.ts            ← OMP entry: injects native judgment capabilities
+│   ├── native-decisions.ts ← typed questions, answer validation, bounded judgment analysis
 │   ├── gate.ts           ← ToolGate (abstract template method) + dep contracts
 │   ├── bash-tool.ts      ← BashToolGate (shadows built-in, delegates)
 │   ├── eval-tool.ts      ← EvalToolGate (shadows built-in, delegates)
@@ -311,7 +334,7 @@ smart-approve/
 │   ├── eval-analyzer.ts  ← EvalCodeBehaviorAnalyzer (subprocess intent)
 │   ├── hub-guard.ts      ← HubLaunchGuard (hub op:"start" regex rules)
 │   ├── types.ts          ← ExtensionAPI, ToolDefinition, DangerAnalysis, …
-│   ├── host.ts           ← HostResolver + ModelInvoker (persistent RPC)
+│   ├── host.ts           ← HostResolver + ModelInvoker (chat/judgment routing)
 │   ├── rpc-invoker.ts    ← RPC client: spawn/reuse/kill omp --mode rpc child
 │   ├── paths.ts          ← ProtectedPathMatcher (symlink-aware)
 │   ├── config.ts         ← ConfigStore (load / update / persist)
@@ -324,7 +347,8 @@ smart-approve/
 │   └── utils/
 │       └── rotating-log.ts
 └── dist/
-    └── index.js          ← bundled output (bun build)
+    ├── index.js          ← generic Pi entry (no OMP runtime dependency)
+    └── omp.js            ← OMP entry (host-provided AI package)
 ```
 
 ### Runtime artifacts

@@ -17,7 +17,7 @@
  * fit the 30s budget.
  */
 
-import type { ExtensionAPI, ExtensionCtx, ToolCallEvent } from "./types";
+import type { ExtensionAPI, ExtensionCtx, ToolCallEvent, NativeJudgmentSupport } from "./types";
 import { Logger } from "./logger";
 import { detectLang, getI18n } from "./i18n";
 import type { Lang } from "./i18n";
@@ -53,7 +53,7 @@ class SmartApprove {
   private readonly modeManager: ModeManager;
   private readonly hubGuard: HubLaunchGuard;
 
-  constructor(private readonly pi: ExtensionAPI) {
+  constructor(private readonly pi: ExtensionAPI, nativeJudgment?: NativeJudgmentSupport) {
     this.logger = new Logger();
     this.lang = detectLang();
     this.configStore = new ConfigStore(this.logger);
@@ -65,6 +65,7 @@ class SmartApprove {
       host, this.logger,
       this.configStore.config.analysisTimeoutMs,
       this.configStore.config.rpcIdleTimeoutMs,
+      nativeJudgment,
     );
     this.policy = new AutoDecisionPolicy(this.configStore.config);
     this.hubGuard = new HubLaunchGuard();
@@ -209,6 +210,6 @@ class SmartApprove {
 }
 
 // Extension host expects a default export: (pi) => void, registering hooks.
-export default function smartApprove(pi: ExtensionAPI): void {
-  new SmartApprove(pi).register();
+export default function smartApprove(pi: ExtensionAPI, nativeJudgment?: NativeJudgmentSupport): void {
+  new SmartApprove(pi, nativeJudgment).register();
 }
