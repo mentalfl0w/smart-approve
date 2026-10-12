@@ -31,8 +31,8 @@ LLM calls bash / eval
               │
           mode: "interactive"          mode: "auto"
               │                            │
-          LLM analysis (@tiny first,     LLM analysis
-          @smol → @default fallback)     AutoDecisionPolicy
+          native classifier/judge        native classifier/judge
+          or chat RPC fallback           or chat RPC fallback
               │                            ├─ recommend=deny / risk ≥ threshold → block
           dialog:                          ├─ allow → execute + non-blocking notify
           session allow / permanent        └─ LLM down → autoFallback:
@@ -92,17 +92,23 @@ SmartApprove (orchestrator)
 
 `ToolGate` defines the invariant flow (hard-block → allow-list → no-behavior → headless → verdict → remember → delegate); each concrete gate implements three hooks — `analyze()` / `buildKey()` / `delegate()` — plus its schema and subject extraction. Adding a new covered tool means adding one subclass, not touching the pipeline. Collaborators are injected as narrow interfaces (`AllowListLike`, `ModelInvokerLike`, `LoggerLike`), so the branch matrix is unit-testable without a running host.
 
-## LLM risk analysis: persistent RPC session
+## Model risk analysis: chat RPC and native decisions
 
-Risk analysis does **not** cold-start a new `omp -p` subprocess per call. Instead, the extension spawns **one** `omp --mode rpc` child on first use and reuses it over a JSONL stdio protocol for every analysis in the session:
+Chat models keep using one persistent `omp --mode rpc` child per session:
 
-- **One process, many prompts** — extension loading (including `provider-retry-proxy`) and process startup are paid once per host session, not per analysis
-- **Per-attempt timeout** — each prompt is bounded by `analysisTimeoutMs` (default 30s, `0` = no timeout); a hung remote model cannot freeze the covered tools
-- **Model fallback chain** — @tiny first (cheapest), then @smol, then @default; each attempt time-bounded; total failure degrades per `mode` (rule-label dialog, or `autoFallback`)
-- **Interruption** — the tool's `AbortSignal` is forwarded to the RPC child (`abort` command), so a user interrupt cancels an in-flight analysis instead of leaving it running
-- **Lifecycle** — the child is lazily spawned on first use, killed via `session_shutdown`, reaped after `rpcIdleTimeoutMs` (default 10 min) of inactivity, and exits on its own if the host dies (stdin EOF closes → process exits code 0, no orphans)
+- **One process, many prompts** — extension loading and process startup are paid once per host session.
+- **Per-attempt timeout and fallback** — each chat attempt is bounded by `analysisTimeoutMs`; the configured model is tried before `@tiny` → `@smol` → `@default`.
+- **Interruption and lifecycle** — the tool's `AbortSignal` cancels the active RPC prompt; the child is closed on `session_shutdown` and reaped after `rpcIdleTimeoutMs`.
 
-The LLM receives: session context (original user task + recent agent plan, injection-guarded), detected behavior labels, and the subject (command or code). It returns structured JSON: `risk` (low/medium/high), `summary`, `detail`, `recommend`.
+Registered native decision models bypass chat RPC. Pi uses `ctx.modelRegistry.classify()` for registered classifier models. OMP uses its model registry, credentials, resolved headers, and `@oh-my-pi/pi-ai` `createNativeJudge()` when those APIs are available (OMP 18.10+). Use an exact `provider/model-id` selector so the adapter can identify the model unambiguously.
+
+Both native APIs receive the session context, detected behavior labels, and the exact command or code as untrusted evidence. They return typed choices for risk (`low`/`medium`/`high`) and recommendation (`allow`/`deny`); Smart Approve passes them through its existing `AutoDecisionPolicy`. Native results do not include chat summaries or details.
+
+For example, OMP 18.10+ can use `openrouter/openai/gpt-6-luna-decisions`. Pi requires a registered classifier model, such as `openai/gpt-6-luna` with `OPENAI_API_KEY` or OpenRouter's TypeSafe Jev classifier. Use the exact `provider/model-id` exposed by that host; Pi's current OpenRouter classifier catalog does not list the OpenAI Decisions model.
+
+If a selected native model is unavailable, returns invalid answers, times out, or is cancelled, analysis returns no verdict; it is not silently sent through a different chat model. Interactive mode asks the user. Auto mode uses `autoFallback` (`"block"` rejects all reviewable operations without a verdict).
+
+The configured `analysisTimeoutMs` bounds each chat attempt and the complete native judgment attempt. `0` disables the plugin deadline; provider-level limits still apply.
 
 ## Features
 
@@ -247,16 +253,16 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 | `enabled` | `true` | Master switch |
 | `mode` | `"interactive"` | `"interactive"` (dialogs) or `"auto"` (AI decides, no dialogs). Switchable at runtime via `/smart-approve` |
 | `autoBlockRisk` | `"high"` | Auto mode: AI risk at or above this level blocks (`"high"` or `"medium"`) |
-| `autoFallback` | `"regex"` | Auto mode when the LLM chain fails: `"regex"` (hard-block + deny tier still block, rest executes) or `"block"` (everything reviewable blocks) |
+| `autoFallback` | `"regex"` | Auto mode when no valid model verdict is available: `"regex"` (hard-block + deny tier still block, rest executes) or `"block"` (everything reviewable blocks) |
 | `autoInHeadless` | `false` | Auto mode also applies in headless/subagent sessions (AI decides instead of blanket block) |
 | `coverage.eval` | `true` | Shadow the `eval` tool; set `false` on hosts without a native eval tool |
 | `protectedPaths` | 20+ built-in patterns | Glob patterns for write/edit interception; `!` prefix negates |
 | `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = rule-only |
 | `rememberDecisions` | `true` | Whether to offer remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the LLM |
-| `analysisTimeoutMs` | `30000` | Per-attempt timeout for the RPC risk-analysis prompt in ms; `0` = no timeout. On timeout/failure the model chain advances @tiny → @smol → @default, then falls back per mode |
+| `analysisTimeoutMs` | `30000` | Chat: timeout per RPC attempt. Native decision: deadline for the whole analysis, including model-header resolution. `0` disables the plugin timeout; provider limits still apply |
 | `rpcIdleTimeoutMs` | `600000` | Idle lifetime of the persistent RPC child in ms; `0` = keep alive until session end |
-| `model` | `@tiny` | Model spec for risk analysis (role alias, provider/id, or bare id) |
+| `model` | `@tiny` | Chat role alias/provider/id, or a fully qualified registered Pi classifier / OMP native-judgment model |
 
 ## Allow-list (decision memory)
 
@@ -284,7 +290,9 @@ Session allows are in-memory only, cleared on restart. You can edit or delete th
 | `pi.registerTool({ name, parameters, execute })` | Custom "bash"/"eval" tools shadowing the built-ins |
 | `pi.zod` | Injected zod module for tool parameter schemas |
 | `ctx.invokeTool(params, opts)` | Delegate execution to the native tool of the same name |
-| `child_process.spawn(hostBin, ["--mode", "rpc", ...])` | Persistent RPC child for LLM risk analysis |
+| `child_process.spawn(hostBin, ["--mode", "rpc", ...])` | Persistent RPC child for chat-model risk analysis |
+| `ctx.modelRegistry.classify()` | Pi classifier lookup, credentials, and typed classification |
+| `@oh-my-pi/pi-ai.createNativeJudge()` | OMP native judgment transport, loaded only when supported |
 | `pi.on("tool_call", handler)` | hub launch gating + write/edit protected-path interception |
 | `pi.on("session_start" / "session_shutdown")` | Status chip / RPC child cleanup |
 | `pi.registerCommand("smart-approve", …)` | Runtime mode switching + status |
@@ -311,8 +319,11 @@ smart-approve/
 │   ├── eval-analyzer.ts  ← EvalCodeBehaviorAnalyzer (subprocess intent)
 │   ├── hub-guard.ts      ← HubLaunchGuard (hub op:"start" regex rules)
 │   ├── types.ts          ← ExtensionAPI, ToolDefinition, DangerAnalysis, …
-│   ├── host.ts           ← HostResolver + ModelInvoker (persistent RPC)
-│   ├── rpc-invoker.ts    ← RPC client: spawn/reuse/kill omp --mode rpc child
+│   ├── host.ts           ← HostResolver + ModelInvoker (chat/native routing)
+│   ├── native-decision-adapter.ts  ← selector + shared timeout/cancellation lifecycle
+│   ├── native-decision-protocol.ts ← host-neutral state, questions, and answer mapping
+│   ├── omp-native-judge-adapter.ts ← OMP registry/auth + native Judgment API
+│   ├── pi-classifier-adapter.ts    ← Pi classifier registry adapter
 │   ├── paths.ts          ← ProtectedPathMatcher (symlink-aware)
 │   ├── config.ts         ← ConfigStore (load / update / persist)
 │   ├── allowlist.ts      ← AllowList (session + permanent)
@@ -324,7 +335,7 @@ smart-approve/
 │   └── utils/
 │       └── rotating-log.ts
 └── dist/
-    └── index.js          ← bundled output (bun build)
+    └── index.js          ← bundled output (OMP AI module stays external)
 ```
 
 ### Runtime artifacts
