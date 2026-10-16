@@ -99,6 +99,7 @@ Chat models keep using one persistent `omp --mode rpc` child per session:
 - **One process, many prompts** — extension loading and process startup are paid once per host session.
 - **Per-attempt timeout and fallback** — each chat attempt is bounded by `analysisTimeoutMs`; the configured model is tried before `@tiny` → `@smol` → `@default`.
 - **Interruption and lifecycle** — the tool's `AbortSignal` cancels the active RPC prompt; the child is closed on `session_shutdown` and reaped after `rpcIdleTimeoutMs`.
+- **Quota waits (OMP only)** — the RPC child receives a private `--config` overlay with `retry.waitForUsageReset: false`, so it does not wait for the quota reset window. The user's global config remains unchanged; Pi receives no OMP-specific option.
 
 Registered native decision models bypass chat RPC. Pi uses `ctx.modelRegistry.classify()` for registered classifier models. OMP uses its model registry, credentials, resolved headers, and `@oh-my-pi/pi-ai` `createNativeJudge()` when those APIs are available (OMP 18.10+). Use an exact `provider/model-id` selector so the adapter can identify the model unambiguously.
 

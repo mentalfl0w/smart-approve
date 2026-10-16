@@ -156,12 +156,13 @@ export class ModelInvoker {
     prompt: string,
     model: string,
     signal?: AbortSignal,
+    ompHost = false,
   ): Promise<RiskAnalysis | null> {
     const bin = this.host.resolve();
     if (!bin) return null;
 
     // Lazy-spawn the persistent RPC child on first use.
-    this.rpc ??= new RpcModelInvoker(bin, this.logger, this.rpcIdleTimeoutMs);
+    this.rpc ??= new RpcModelInvoker(bin, this.logger, this.rpcIdleTimeoutMs, ompHost);
 
     const run = async (m: string): Promise<string | null> => {
       this.logger.log(`runOneShotModel: rpc prompt model=${m}`);
@@ -222,7 +223,7 @@ export class ModelInvoker {
 
   /** Shut down the persistent RPC child (session shutdown). */
   dispose(): void {
-    this.rpc?.kill();
+    this.rpc?.dispose();
     this.rpc = null;
   }
 
@@ -274,7 +275,8 @@ export class ModelInvoker {
       t.promptOnlyJson,
     ].join("\n");
 
-    return this.invoke(prompt, model, signal);
+    const isOmpHost = typeof ctx?.modelRegistry?.find === "function";
+    return this.invoke(prompt, model, signal, isOmpHost);
   }
 }
 
