@@ -223,3 +223,66 @@ test("unregistered model specs retain the existing chat RPC fallback path", asyn
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("OMP RPC falls back instead of waiting for an exhausted default model's quota reset", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-quota-wait-"));
+  const logger = new Logger(dir);
+  const fakeHost = path.join(dir, "fake-omp");
+  fs.writeFileSync(
+    fakeHost,
+    `#!${process.execPath}
+const fs = require("node:fs");
+const readline = require("node:readline");
+const args = process.argv.slice(2);
+const configIndex = args.indexOf("--config");
+const overlay = configIndex < 0 ? "" : fs.readFileSync(args[configIndex + 1], "utf8");
+const waitForUsageReset = !/waitForUsageReset:\\s*false/.test(overlay);
+const modelIndex = args.indexOf("--model");
+const model = modelIndex < 0 ? "" : args[modelIndex + 1];
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const send = (frame) => process.stdout.write(JSON.stringify(frame) + "\\n");
+rl.on("line", (line) => {
+  const frame = JSON.parse(line);
+  if (frame.type === "prompt") {
+    if (waitForUsageReset) {
+      send({ type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+    } else if (model === "@default") {
+      send({ type: "response", command: "prompt", success: false, error: "usage limit exhausted" });
+    } else {
+      send({ type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+      send({
+        type: "agent_end",
+        isTerminal: true,
+        messages: [{ role: "assistant", content: [{ type: "text", text: "{\\"risk\\":\\"low\\",\\"recommend\\":\\"allow\\"}" }] }],
+      });
+    }
+  } else if (frame.type === "abort") {
+    send({ type: "agent_end", isTerminal: true, messages: [] });
+  }
+});
+send({ type: "ready", protocolVersion: 1 });
+`,
+    { mode: 0o700 },
+  );
+  const host = new HostResolver(logger);
+  host.resolve = () => fakeHost;
+  const invoker = new ModelInvoker(host, logger, 150, 0);
+  const registry: HostModelRegistry = { find: () => undefined };
+
+  try {
+    const result = await invoker.analyze(
+      subject,
+      "Shell command",
+      behaviorLabels,
+      contextSection,
+      translations,
+      "@default",
+      undefined,
+      contextWithRegistry(registry),
+    );
+    assert.deepEqual(result, { risk: "low", recommend: "allow" });
+  } finally {
+    invoker.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
