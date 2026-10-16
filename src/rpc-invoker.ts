@@ -18,6 +18,9 @@
  * shutdown. A crashed child is respawned on the next call.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as child_process from "node:child_process";
 import * as readline from "node:readline";
 import type { Logger } from "./logger";
@@ -59,12 +62,16 @@ export class RpcModelInvoker {
   private readonly bin: string;
   private readonly logger: Logger;
   private readonly idleTimeoutMs: number;
+  private readonly disableUsageResetWait: boolean;
+  private configDir: string | null = null;
+  private configPath: string | null = null;
 
   /** @param idleTimeoutMs Reap the child after this long without prompts (0 = keep alive). */
-  constructor(bin: string, logger: Logger, idleTimeoutMs: number) {
+  constructor(bin: string, logger: Logger, idleTimeoutMs: number, disableUsageResetWait = false) {
     this.bin = bin;
     this.logger = logger;
     this.idleTimeoutMs = idleTimeoutMs;
+    this.disableUsageResetWait = disableUsageResetWait;
   }
 
   /** True when a spawn attempt has been made and the process is alive. */
@@ -83,7 +90,7 @@ export class RpcModelInvoker {
     return this.chain;
   }
 
-  /** Kill the child process (session shutdown, model switch, or idle reap). */
+  /** Kill the child process for model changes or idle reaping. */
   kill(): void {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
@@ -98,6 +105,12 @@ export class RpcModelInvoker {
     this.rl = null;
     this.pending = null;
     this.spawnPromise = null;
+  }
+
+  /** Kill the child and remove its process-local configuration overlay. */
+  dispose(): void {
+    this.kill();
+    this.removeConfigOverlay();
   }
 
   // ── internals ─────────────────────────────────────────────────────
@@ -167,11 +180,44 @@ export class RpcModelInvoker {
 
     return promise;
   }
+  /** Create a private, process-local OMP config overlay disabling quota-reset waits. */
+  private createConfigOverlay(): string {
+    if (this.configPath) return this.configPath;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-omp-"));
+    try {
+      fs.chmodSync(dir, 0o700);
+      const configPath = path.join(dir, "config.yaml");
+      fs.writeFileSync(configPath, "retry:\n  waitForUsageReset: false\n", {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      this.configDir = dir;
+      this.configPath = configPath;
+      return configPath;
+    } catch (error) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+      throw error;
+    }
+  }
+
+  private removeConfigOverlay(): void {
+    if (!this.configDir) return;
+    try {
+      fs.rmSync(this.configDir, { recursive: true, force: true });
+    } catch (error) {
+      this.logger.log(`rpc: failed to remove temporary config overlay: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.configDir = null;
+      this.configPath = null;
+    }
+  }
+
 
   /** Spawn the RPC child and wait for the ready frame. */
   private spawn(model: string): Promise<void> {
     const { promise, resolve, reject } = Promise.withResolvers<void>();
-    const proc = child_process.spawn(this.bin, [
+    const args = [
       "--mode", "rpc",
       "--model", model,
       "--no-tools",
@@ -185,7 +231,11 @@ export class RpcModelInvoker {
       "--no-extensions",
       "--thinking=off",
       "--max-time=300",
-    ], {
+    ];
+    if (this.disableUsageResetWait) {
+      args.push("--config", this.createConfigOverlay());
+    }
+    const proc = child_process.spawn(this.bin, args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, PI_MEMORY_BACKEND: "off" },
     });
