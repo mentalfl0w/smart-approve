@@ -101,7 +101,7 @@ function mergeConfig(user: unknown): SmartApproveConfig {
 
 /** Resolve config directory: ~/.omp/agent or ~/.pi/agent. */
 export function getConfigDir(): string {
-  const home = os.homedir();
+  const home = process.env.HOME || os.homedir();
   const ompDir = path.join(home, ".omp", "agent");
   const piDir = path.join(home, ".pi", "agent");
   if (fs.existsSync(ompDir)) return ompDir;

@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ConfigStore } from "./config.ts";
-import { ModeManager } from "./mode-manager.ts";
+import { ModeManager, type CoverageSummary } from "./mode-manager.ts";
 import type { LoggerLike } from "./logger.ts";
 
 const silentLogger: LoggerLike = { log: () => undefined };
@@ -18,7 +18,10 @@ function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-test-"));
 }
 
-function makeManager(dir: string, coverage = { eval: true, hub: true }) {
+function makeManager(
+  dir: string,
+  coverage: CoverageSummary = { bash: true, eval: true, procInput: "false", protectedPaths: true },
+) {
   const store = new ConfigStore(silentLogger, dir);
   return { store, manager: new ModeManager(store, silentLogger, coverage) };
 }
@@ -66,11 +69,31 @@ test("set to the current mode is a no-op that still persists cleanly", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("status block reports mode and coverage", () => {
+test("status reports enabled protection surfaces without legacy Hub coverage", () => {
   const dir = tempDir();
-  const { store, manager } = makeManager(dir, { eval: false, hub: true });
+  const { manager } = makeManager(dir, { bash: true, eval: false, procInput: "false", protectedPaths: true });
   const status = manager.status();
   assert.match(status, /mode: interactive/);
-  assert.match(status, /coverage: eval=false hub=true/);
+  assert.match(status, /coverage: bash=true eval=false proc-input=false protected-paths=true/);
+  assert.doesNotMatch(status, /hub=/i);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("status distinguishes shell-only proc input when Eval coverage is disabled", () => {
+  const dir = tempDir();
+  const { manager } = makeManager(dir, { bash: true, eval: false, procInput: "shell-only", protectedPaths: true });
+  assert.match(manager.status(), /proc-input=shell-only/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("legacy coverage.hub config is ignored without breaking configuration", () => {
+  const dir = tempDir();
+  fs.writeFileSync(
+    path.join(dir, "smart-approve.json"),
+    JSON.stringify({ coverage: { eval: false, hub: true } }),
+    "utf-8",
+  );
+  const store = new ConfigStore(silentLogger, dir);
+  assert.deepEqual(store.config.coverage, { eval: false });
   fs.rmSync(dir, { recursive: true, force: true });
 });

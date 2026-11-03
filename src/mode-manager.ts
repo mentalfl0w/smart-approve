@@ -11,10 +11,14 @@ import type { ConfigStore } from "./config";
 import type { ApprovalMode } from "./config";
 import type { LoggerLike } from "./logger";
 
-/** Coverage summary shown by the status command. */
+export type ProcInputCoverage = "false" | "shell-only" | "tracked";
+
+/** Protection surfaces currently enabled for this host. */
 export interface CoverageSummary {
+  bash: boolean;
   eval: boolean;
-  hub: boolean;
+  procInput: ProcInputCoverage;
+  protectedPaths: boolean;
 }
 
 export class ModeManager {
@@ -47,7 +51,7 @@ export class ModeManager {
       `autoFallback: ${c.autoFallback}`,
       `autoInHeadless: ${c.autoInHeadless}`,
       `llmAnalysis: ${c.llmAnalysis}`,
-      `coverage: eval=${this.coverage.eval} hub=${this.coverage.hub}`,
+      `coverage: bash=${this.coverage.bash} eval=${this.coverage.eval} proc-input=${this.coverage.procInput} protected-paths=${this.coverage.protectedPaths}`,
     ].join("\n");
   }
 }
