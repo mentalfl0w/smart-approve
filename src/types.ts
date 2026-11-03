@@ -11,14 +11,21 @@ import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
 
 // ── Extension API surface (minimal; no host import) ──────────────────
 
-/** The pi/omp extension API surface used by this extension. */
 export interface ExtensionAPI {
   on(
-    event: "tool_call" | "session_start" | "session_shutdown",
+    event: "tool_call",
     handler: (
       event: ToolCallEvent,
       ctx: ExtensionCtx,
-    ) => Promise<void | { block: true; reason: string }>,
+    ) => Promise<void | ToolCallHandlerResult>,
+  ): void;
+  on(
+    event: "tool_result",
+    handler: (event: ToolResultEvent, ctx: ExtensionCtx) => Promise<void | ToolResultEventPatch>,
+  ): void;
+  on(
+    event: "session_start" | "session_shutdown",
+    handler: (event: unknown, ctx: ExtensionCtx) => void | Promise<void>,
   ): void;
   /** Register a slash command callable from the TUI/RPC host. */
   registerCommand(
@@ -32,6 +39,8 @@ export interface ExtensionAPI {
   exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
   /** Register a custom tool callable by the LLM. */
   registerTool<TParams = unknown, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;
+  /** Return the current configured tool schemas and source metadata when supported. */
+  getAllTools?: () => HostToolInfo[];
   /** Injected zod module for tool parameter schemas (runtime-injected by host). */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   zod: any;
@@ -79,11 +88,41 @@ export interface AgentToolResult<TDetails = unknown> {
   details?: TDetails;
   isError?: boolean;
 }
-
 export interface ToolCallEvent {
   toolName: string;
   toolCallId?: string;
   input: { command?: string; path?: string; [k: string]: unknown };
+}
+
+export interface ToolCallHandlerResult {
+  block?: boolean;
+  reason?: string;
+  input?: Record<string, unknown>;
+  additionalContext?: string;
+}
+
+export interface ToolResultEvent {
+  toolName: string;
+  toolCallId?: string;
+  input: Record<string, unknown>;
+  content?: unknown[];
+  details?: unknown;
+  isError: boolean;
+}
+
+export interface ToolResultEventPatch {
+  content?: unknown[];
+  details?: unknown;
+  isError?: boolean;
+  additionalContext?: string;
+}
+
+/** Native metadata is used only when a host exposes a built-in tool schema. */
+export interface HostToolInfo {
+  name: string;
+  description?: string;
+  parameters?: unknown;
+  sourceInfo?: { source?: string };
 }
 
 /** Optional model registry surface; Pi and OMP provide different capabilities. */
@@ -105,11 +144,14 @@ export interface HostModelRegistry {
 export interface ExtensionCtx {
   hasUI: boolean;
   cwd?: string;
+  signal?: AbortSignal;
   lang?: string;
   modelRegistry?: HostModelRegistry;
   sessionManager?: {
     getBranch?: () => unknown[];
     getEntries?: () => unknown[];
+    /** Public session id, when the host exposes one (OMP). */
+    getSessionId?: () => string | undefined;
   };
   ui: {
     confirm: (title: string, body: string) => Promise<boolean>;
@@ -169,6 +211,8 @@ export interface DangerAnalysis {
   denyTier: boolean;
   /** True if any matched behavior is in the hard-block set. */
   hardBlocked: boolean;
+  /** Requires a user confirmation even when auto mode has a model verdict. */
+  requiresConfirmation?: boolean;
 }
 
 /** A persisted or in-memory allow-list decision. */

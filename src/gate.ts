@@ -20,6 +20,7 @@ import type {
   DangerAnalysis,
   RiskAnalysis,
   ZodLike,
+  HostToolInfo,
 } from "./types";
 import type { SmartApproveConfig } from "./config";
 import type { AutoDecisionPolicy } from "./policy";
@@ -64,7 +65,12 @@ export interface GateDeps {
   logger: LoggerLike;
   lang: Lang;
   t: I18n;
+  protectedPathMatcher?: { isProtected(filePath: string, baseCwd?: string): boolean };
 }
+
+export type GateAuthorization =
+  | { allowed: true }
+  | { allowed: false; result: AgentToolResult };
 
 /** Tool update callback, matching ToolDefinition.execute's onUpdate. */
 export type ToolUpdateCallback =
@@ -95,7 +101,7 @@ export abstract class ToolGate {
   /** Working directory used for allowlist scoping. */
   protected abstract resolveCwd(params: unknown, ctx: ExtensionCtx): string;
   /** Per-tool behavior analysis. */
-  protected abstract analyze(subject: string): DangerAnalysis;
+  protected abstract analyze(subject: string, params: unknown, ctx: ExtensionCtx): DangerAnalysis;
   /** Allowlist key derived from the subject. */
   protected abstract buildKey(subject: string): string;
   /** Display label for the subject ("Command" / "Code"). */
@@ -121,83 +127,107 @@ export abstract class ToolGate {
 
   // ── Registration ───────────────────────────────────────────────────
 
-  /** Register this gate as a custom tool shadowing the native built-in. */
-  register(pi: ExtensionAPI): void {
+  /** Register a same-name tool gate, reusing the native tool's live schema when supplied. */
+  register(pi: ExtensionAPI, nativeTool?: Pick<HostToolInfo, "description" | "parameters">): void {
     pi.registerTool({
       name: this.toolName,
       label: this.toolLabel,
-      description: this.toolDescription,
-      parameters: this.buildSchema(pi.zod),
+      description: nativeTool?.description
+        ? `${nativeTool.description}\n\n${this.toolDescription}`
+        : this.toolDescription,
+      parameters: nativeTool?.parameters ?? this.buildSchema(pi.zod),
       approval: "exec",
       strict: this.strict,
-      execute: (toolCallId, params, signal, onUpdate, ctx) =>
+      execute: (_toolCallId, params, signal, onUpdate, ctx) =>
         this.execute(params, signal, onUpdate, ctx),
     });
   }
 
   // ── Template method: the shared decision pipeline ──────────────────
 
-  async execute(
+  async authorize(
     params: unknown,
     signal: AbortSignal | undefined,
-    onUpdate: ToolUpdateCallback,
     ctx: ExtensionCtx,
-  ): Promise<AgentToolResult> {
+  ): Promise<GateAuthorization> {
     const { config, allowList, contextGatherer, modelInvoker, policy, logger, lang, t } = this.deps;
-
     const subject = this.extractSubject(params);
-    if (!subject.trim()) {
-      logger.log(`${this.toolName}: empty subject, passing through`);
-      return this.onEmpty(params, signal, onUpdate, ctx);
-    }
+    if (!subject.trim()) return { allowed: true };
 
     const effectiveCwd = this.resolveCwd(params, ctx);
     const hasUI = ctx.hasUI;
     logger.log(`${this.toolName}: subject="${subject.slice(0, 80)}" cwd=${effectiveCwd} hasUI=${hasUI}`);
 
-    const analysis = this.analyze(subject);
+    const analysis = this.analyze(subject, params, ctx);
     const label = analysis.labels[0]?.[lang] || analysis.labels[0]?.en || "danger";
     const subjectLabel = this.subjectDisplayLabel();
 
-    // 1. Hard-block wins over the allowlist (entries can predate a rule
-    //    upgrade or be hand-edited into the allow file).
+    // Hard-block always wins over the allowlist.
     if (analysis.hardBlocked) {
       logger.log(`${this.toolName}: hard-blocked (${label})`);
-      return this.textError(`Blocked: ${label}\n${subjectLabel}: ${subject}`, { blocked: true, reason: label });
+      return {
+        allowed: false,
+        result: this.textError(
+          `Blocked: ${label}\n${subjectLabel}: ${subject}`,
+          { blocked: true, reason: label },
+        ),
+      };
     }
 
-    // 2. Allowlist hit → delegate directly.
-    if (config.rememberDecisions && allowList.isAllowed(this.toolName, this.buildKey(subject), effectiveCwd)) {
-      logger.log(`${this.toolName}: allowlist hit, delegating to native`);
-      return this.delegate(params, signal, onUpdate, ctx);
+    if (
+      !analysis.requiresConfirmation &&
+      config.rememberDecisions &&
+      allowList.isAllowed(this.toolName, this.buildKey(subject), effectiveCwd)
+    ) {
+      return { allowed: true };
     }
 
-    // 3. No dangerous behavior → delegate directly (zero interruption).
-    if (analysis.behaviors.length === 0) {
-      return this.delegate(params, signal, onUpdate, ctx);
+    if (analysis.behaviors.length === 0 && !analysis.requiresConfirmation) {
+      return { allowed: true };
     }
 
-    // 4. Dangerous but reviewable.  Headless contexts block unless auto
-    //    mode is configured to decide by AI.
     const autoMode = config.mode === "auto";
+    if (analysis.requiresConfirmation && !hasUI) {
+      logger.log(`${this.toolName}: protected operation blocked (no UI) — ${label}`);
+      return {
+        allowed: false,
+        result: this.textError(
+          `${t.blockedNoUI(label)}\n${subjectLabel}: ${subject}`,
+          { blocked: true, reason: "no-ui" },
+        ),
+      };
+    }
     if (!hasUI && !(autoMode && config.autoInHeadless)) {
       logger.log(`${this.toolName}: blocked (no UI) — ${label}`);
-      return this.textError(`${t.blockedNoUI(label)}\n${subjectLabel}: ${subject}`, { blocked: true, reason: "no-ui" });
+      return {
+        allowed: false,
+        result: this.textError(
+          `${t.blockedNoUI(label)}\n${subjectLabel}: ${subject}`,
+          { blocked: true, reason: "no-ui" },
+        ),
+      };
     }
 
-    // 5. LLM risk analysis (optional; inside execute(), free of the 30s
-    //    EXTENSION_HANDLER_TIMEOUT_MS handler budget).
     let aiResult: RiskAnalysis | null = null;
     let analysisText: string | null = null;
-    if (config.llmAnalysis) {
+    if (config.llmAnalysis && !analysis.requiresConfirmation) {
       ctx.ui.setStatus("smart-approve", t.analyzing);
       try {
         const sessionCtx = contextGatherer.gather(ctx, config.contextMaxChars);
         const contextSection = contextGatherer.format(sessionCtx, t);
-        const behaviorLabels = analysis.labels.map((l) => l[lang] || l.en);
-        logger.log(`${this.toolName}: analyzeRisk subject="${subject.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`);
+        const behaviorLabels = analysis.labels.map((item) => item[lang] || item.en);
+        logger.log(
+          `${this.toolName}: analyzeRisk subject="${subject.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`,
+        );
         aiResult = await modelInvoker.analyze(
-          subject, this.promptSubjectLabel(), behaviorLabels, contextSection, t, config.model, signal, ctx,
+          subject,
+          this.promptSubjectLabel(),
+          behaviorLabels,
+          contextSection,
+          t,
+          config.model,
+          signal,
+          ctx,
         );
         analysisText = formatAnalysis(aiResult, t);
         logger.log(`${this.toolName}: analysisText=${analysisText ? "OK" : "null"}`);
@@ -208,33 +238,51 @@ export abstract class ToolGate {
       }
     }
 
-    // 5b. Interrupted while analyzing → abort, no decision.
     if (signal?.aborted) {
       logger.log(`${this.toolName}: aborted during analysis`);
-      return { content: [{ type: "text", text: "(aborted)" }], details: { aborted: true } };
+      return {
+        allowed: false,
+        result: { content: [{ type: "text", text: "(aborted)" }], details: { aborted: true } },
+      };
     }
 
-    // 6. Verdict: auto mode → policy; interactive → dialog.
-    if (autoMode) {
+    if (autoMode && !analysis.requiresConfirmation) {
       const decision = policy.decide(aiResult, analysis.denyTier);
       logger.log(`${this.toolName}: auto decision=${decision.verdict} reason=${decision.reason} (${label})`);
       if (decision.verdict === "allow") {
         ctx.ui.notify?.(t.autoAllowed(label), "info");
-        return this.delegate(params, signal, onUpdate, ctx);
+        return { allowed: true };
       }
       ctx.ui.notify?.(t.autoBlocked(label), "warning");
-      return this.textError(`${t.autoBlocked(label)}\n${subjectLabel}: ${subject}`, { blocked: true, reason: "auto" });
+      return {
+        allowed: false,
+        result: this.textError(
+          `${t.autoBlocked(label)}\n${subjectLabel}: ${subject}`,
+          { blocked: true, reason: "auto" },
+        ),
+      };
     }
 
     const title = t.confirmTitle(label);
-    const body = analysisText
-      ? `${analysisText}\n\n────────\n${subjectLabel}: ${subject}\n\n${t.allowPrompt}`
-      : `${t.analysisUnavailable}\n\n${subjectLabel}: ${subject}\n\n${t.allowPrompt}`;
-
-    const decision = await confirmWithRemember(ctx, title, body, t, config.rememberDecisions, this.rememberScope);
+    const body = analysis.requiresConfirmation
+      ? `${subjectLabel}: ${subject}\n\n${t.allowPrompt}`
+      : analysisText
+        ? `${analysisText}\n\n────────\n${subjectLabel}: ${subject}\n\n${t.allowPrompt}`
+        : `${t.analysisUnavailable}\n\n${subjectLabel}: ${subject}\n\n${t.allowPrompt}`;
+    const decision = await confirmWithRemember(
+      ctx,
+      title,
+      body,
+      t,
+      config.rememberDecisions,
+      this.rememberScope,
+    );
     if (!decision.ok) {
       logger.log(`${this.toolName}: user denied — ${label}`);
-      return this.textError(t.userDenied(label), { denied: true, reason: label });
+      return {
+        allowed: false,
+        result: this.textError(t.userDenied(label), { denied: true, reason: label }),
+      };
     }
 
     if (decision.remember === "session") {
@@ -242,15 +290,29 @@ export abstract class ToolGate {
     } else if (decision.remember === "permanent") {
       allowList.rememberPermanent(this.toolName, this.buildKey(subject), effectiveCwd);
     }
-
-    // 6b. Interrupted after approval → do not execute.
     if (signal?.aborted) {
       logger.log(`${this.toolName}: aborted after approval, not executing`);
-      return { content: [{ type: "text", text: "(aborted)" }], details: { aborted: true } };
+      return {
+        allowed: false,
+        result: { content: [{ type: "text", text: "(aborted)" }], details: { aborted: true } },
+      };
     }
+    return { allowed: true };
+  }
 
-    // 7. Execute — delegate to the native tool.
-    logger.log(`${this.toolName}: approved, delegating to native`);
+  async execute(
+    params: unknown,
+    signal: AbortSignal | undefined,
+    onUpdate: ToolUpdateCallback,
+    ctx: ExtensionCtx,
+  ): Promise<AgentToolResult> {
+    const authorization = await this.authorize(params, signal, ctx);
+    if (!authorization.allowed) return authorization.result;
+    if (!this.extractSubject(params).trim()) {
+      this.deps.logger.log(`${this.toolName}: empty subject, passing through`);
+      return this.onEmpty(params, signal, onUpdate, ctx);
+    }
+    this.deps.logger.log(`${this.toolName}: approved, delegating to native`);
     return this.delegate(params, signal, onUpdate, ctx);
   }
 

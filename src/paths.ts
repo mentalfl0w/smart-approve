@@ -8,6 +8,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 /** Default protected path patterns. */
@@ -76,6 +77,40 @@ function globToRegExp(pattern: string): CompiledPattern {
   return { re: new RegExp(re + "$"), negate };
 }
 
+/** Resolve a local path and its symlinked ancestors, including missing write targets. */
+export function resolveFilesystemPathCandidates(
+  filePath: string,
+  baseCwd = process.cwd(),
+): string[] {
+  if (!filePath) return [];
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(filePath)) return [filePath];
+
+  const home = process.env.HOME || os.homedir();
+  const expanded = filePath === "~"
+    ? home
+    : filePath.startsWith("~/")
+      ? path.join(home, filePath.slice(2))
+      : filePath;
+  const absolutePath = path.resolve(baseCwd, expanded);
+  const missingSegments: string[] = [];
+  let ancestor = absolutePath;
+  let resolvedPath = absolutePath;
+
+  while (true) {
+    try {
+      resolvedPath = path.resolve(fs.realpathSync(ancestor), ...missingSegments);
+      break;
+    } catch {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      missingSegments.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+
+  return resolvedPath === absolutePath ? [absolutePath] : [absolutePath, resolvedPath];
+}
+
 /**
  * Glob matcher for protected paths.
  * Stateless after construction; safe to call concurrently.
@@ -89,30 +124,18 @@ export class ProtectedPathMatcher {
     this.compiled = patterns.map(globToRegExp);
   }
 
-  /** Check if a path matches any protected pattern (symlink-aware). */
-  isProtected(filePath: string): boolean {
+  /** Check if a path matches any protected pattern, including symlinked parents. */
+  isProtected(filePath: string, baseCwd = process.cwd()): boolean {
     if (!filePath || this.patterns.length === 0) return false;
 
-    const candidates = [filePath];
-    try {
-      const real = fs.realpathSync(filePath);
-      if (real !== filePath) candidates.push(real);
-    } catch {
-      // path may not exist yet (write target) — match on the literal
-    }
-    try {
-      const abs = path.resolve(filePath);
-      if (!candidates.includes(abs)) candidates.push(abs);
-    } catch { /* ignore */ }
-
-    for (const candidate of candidates) {
+    for (const candidate of resolveFilesystemPathCandidates(filePath, baseCwd)) {
       const normalized = candidate.replace(/\\/g, "/");
       const basename = path.basename(candidate);
 
       let matched = false;
       for (const { re, negate } of this.compiled) {
         if (re.test(normalized) || re.test(basename)) {
-          matched = negate ? false : true;
+          matched = !negate;
         }
       }
       if (matched) return true;
