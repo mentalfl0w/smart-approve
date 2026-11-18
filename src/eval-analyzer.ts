@@ -506,6 +506,12 @@ const TASK_GROUP_PROTOCOL = "omp-task-group/eval-result-v1";
 const TASK_GROUP_ID = /^tg[a-z0-9]+$/;
 
 const TASK_GROUP_PROC_WRITE = /\btool\s*\.\s*write\s*\(/g;
+const NON_FILE_TOOL_WRITE_SCHEMES: Record<string, true> = {
+  agent: true,
+  xd: true,
+  out: true,
+};
+
 const STATIC_IDENTIFIER = /[A-Za-z_$][\w$]*/y;
 const MAX_STATIC_EXPRESSION_DEPTH = 32;
 
@@ -689,8 +695,8 @@ function resolveStaticConst(
   return { value: expression.value, identifiers: expression.identifiers, end: end + 1 };
 }
 
-/** Dynamic, shadowed, or runtime-generated `tool` bindings invalidate the shape. */
-function isShadowedTaskGroupTool(code: string): boolean {
+/** Dynamic, shadowed, or runtime-generated `tool` bindings are untrusted. */
+function hasUntrustedToolBinding(code: string): boolean {
   return (
     /\bwith\s*\(/.test(code) ||
     /\b(?:eval|Function)\s*\(/.test(code) ||
@@ -735,43 +741,117 @@ function isTaskGroupProcCancelAt(view: StaticStringView, open: number): boolean 
 }
 
 /** Offsets of recognized Task Group pool-cancel `tool.write` calls. */
-function findTaskGroupProcCancelCalls(source: string, executable: string): Set<number> {
+function findTaskGroupProcCancelCalls(
+  view: StaticStringView,
+  toolBindingUntrusted: boolean,
+): Set<number> {
   const offsets = new Set<number>();
-  if (isShadowedTaskGroupTool(executable)) return offsets;
+  if (toolBindingUntrusted) return offsets;
+
 
   const candidates: number[] = [];
   TASK_GROUP_PROC_WRITE.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = TASK_GROUP_PROC_WRITE.exec(executable)) !== null) {
+  while ((match = TASK_GROUP_PROC_WRITE.exec(view.code)) !== null) {
     const start = match.index;
-    if (start > 0 && /[\w$.]/.test(executable[start - 1])) continue;
+    if (start > 0 && /[\w$.]/.test(view.code[start - 1])) continue;
     candidates.push(start + match[0].lastIndexOf("("));
   }
   if (candidates.length === 0) return offsets;
 
-  const view: StaticStringView = { text: scrub(source, true), code: executable };
   for (const open of candidates) {
     if (isTaskGroupProcCancelAt(view, open)) offsets.add(open);
   }
   return offsets;
 }
 
+function isToolWriteCallAt(text: string, index: number): boolean {
+  let cursor = index;
+  while (cursor > 0 && /\s/.test(text[cursor - 1])) cursor--;
+  if (text[cursor - 1] !== ".") return false;
+  cursor--;
+  while (cursor > 0 && /\s/.test(text[cursor - 1])) cursor--;
+  const start = cursor - 4;
+  return (
+    start >= 0 &&
+    text[start] === "t" &&
+    text[start + 1] === "o" &&
+    text[start + 2] === "o" &&
+    text[start + 3] === "l" &&
+    (start === 0 || !/[\w$.]/.test(text[start - 1]))
+  );
+}
+
+/** Read a static path from the supported `tool.write` object shape. */
+function readToolWriteObjectPath(
+  view: StaticStringView,
+  open: number,
+): StaticStringResolution | undefined {
+  let cursor = skipStaticWhitespace(view.text, open + 1);
+  if (view.text[cursor] !== "{") return undefined;
+  cursor = skipStaticWhitespace(view.text, cursor + 1);
+
+  let pathTarget: StaticStringResolution | undefined;
+  let contentSeen = false;
+  while (cursor < view.text.length) {
+    cursor = skipStaticWhitespace(view.text, cursor);
+    if (view.text[cursor] === "}") return pathTarget;
+
+    const identifier = readStaticIdentifier(view.text, cursor);
+    const literal = identifier ? undefined : readStaticString(view.text, cursor);
+    const property = identifier?.name ?? literal?.value;
+    const propertyEnd = identifier?.end ?? literal?.end;
+    if ((property !== "path" && property !== "content") || propertyEnd === undefined) {
+      return undefined;
+    }
+    cursor = skipStaticWhitespace(view.text, propertyEnd);
+    if (view.text[cursor] !== ":") return undefined;
+
+    const valueStart = cursor + 1;
+    if (property === "path") {
+      if (pathTarget) return undefined;
+      pathTarget = resolveStaticExpression(view, valueStart, [], 0);
+      if (!pathTarget) return undefined;
+      cursor = pathTarget.end;
+    } else {
+      if (contentSeen) return undefined;
+      contentSeen = true;
+      const contentStart = skipStaticWhitespace(view.text, valueStart);
+      const content = readStaticString(view.text, contentStart) ??
+        readStaticIdentifier(view.text, contentStart);
+      if (!content) return undefined;
+      cursor = content.end;
+    }
+
+    cursor = skipStaticWhitespace(view.text, cursor);
+    if (view.text[cursor] === ",") {
+      cursor++;
+      continue;
+    }
+    if (view.text[cursor] === "}") return pathTarget;
+    return undefined;
+  }
+  return undefined;
+}
+
 /** Static file-write targets from Eval helpers, Python magics, and common file APIs. */
 export function extractEvalWriteTargets(code: string, language?: string): EvalWriteTargets {
   const source = String(code ?? "");
   const executable = scrub(source, false);
+  const withStrings = scrub(source, true);
   const pythonScan = isPythonLanguage(language)
-    ? scanPythonMagics(source, executable, scrub(source, true))
+    ? scanPythonMagics(source, executable, withStrings)
     : undefined;
+  const view: StaticStringView = { text: withStrings, code: executable };
   const paths = new Set<string>();
   const cwdOperations: Array<{ offset: number; target: string }> = [];
   let cwdDynamic = false;
   let dynamic = false;
   const scanText = pythonScan ? pythonScan.maskedCode : executable;
-  // Task Group eval programs are JavaScript; Python cells keep current behavior.
+  const toolBindingUntrusted = hasUntrustedToolBinding(executable);
   const staticProcCancelCalls = pythonScan
     ? undefined
-    : findTaskGroupProcCancelCalls(source, executable);
+    : findTaskGroupProcCancelCalls(view, toolBindingUntrusted);
 
   for (const call of EVAL_WRITE_CALLS) {
     call.pattern.lastIndex = 0;
@@ -779,6 +859,26 @@ export function extractEvalWriteTargets(code: string, language?: string): EvalWr
     while ((match = call.pattern.exec(scanText)) !== null) {
       const open = match.index + match[0].lastIndexOf("(");
       if (call.mode === "write" && staticProcCancelCalls?.has(open)) continue;
+      if (
+        call.mode === "write" &&
+        !toolBindingUntrusted &&
+        isToolWriteCallAt(scanText, match.index) &&
+        view.text[skipStaticWhitespace(view.text, open + 1)] === "{"
+      ) {
+        const target = readToolWriteObjectPath(view, open);
+        if (!target || !target.value) {
+          dynamic = true;
+          continue;
+        }
+        const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(target.value)?.[1]?.toLowerCase();
+        if (scheme) {
+          if (NON_FILE_TOOL_WRITE_SCHEMES[scheme] !== true) dynamic = true;
+          continue;
+        }
+        paths.add(target.value);
+        continue;
+      }
+
       const first = readQuotedArgument(source, open + 1);
       if (call.mode === "open") {
         const comma = findArgumentComma(source, open + 1);

@@ -456,6 +456,30 @@ test("eval: object write to a protected path still requires confirmation", async
   assert.equal(h.calls.delegate, 0);
 });
 
+test("eval: auto mode delegates object tool.write virtual targets without a confirmation dialog", async () => {
+  const h = makeHarness({ mode: "auto" });
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: 'await tool.write({ "path": "agent://Main", "content": "message" })',
+  });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.delegate, 1);
+  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.selectChoices, null);
+});
+
+test("eval: object tool.write file targets still apply protected-path checks", async () => {
+  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: 'await tool.write({ "path": ".env", "content": "secret" })',
+  });
+  assert.equal(r.isError, true);
+  assert.equal(reasonOf(r), "no-ui");
+  assert.match(r.content[0].text, /protected file/i);
+  assert.equal(h.calls.delegate, 0);
+});
+
 test("eval: direct protected write helper requires confirmation even in auto mode", async () => {
   const h = makeHarness({ mode: "auto" });
   h.selectResult = "Allow for this session";
@@ -501,6 +525,18 @@ test("eval hard-blocks sensitive system-file writes without subprocess intent", 
     code: 'await write("/etc/sudoers.d/agent", "secret")',
   });
   assert.equal(r.isError, true);
+  assert.match(r.content[0].text, /^Blocked:/);
+  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.calls.delegate, 0);
+});
+test("eval hard-blocks system-sensitive positional tool.write targets", async () => {
+  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: 'await tool.write("/etc/passwd", "secret")',
+  });
+  assert.equal(r.isError, true);
+  assert.notEqual(reasonOf(r), "no-ui");
   assert.match(r.content[0].text, /^Blocked:/);
   assert.equal(h.calls.analyze, 0);
   assert.equal(h.calls.delegate, 0);
