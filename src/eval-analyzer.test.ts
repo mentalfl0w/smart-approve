@@ -643,6 +643,47 @@ test("marks non-literal Eval write targets as unresolved", () => {
   });
 });
 
+test("extracts object-form tool.write targets without treating virtual destinations as files", () => {
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": "/tmp/output.txt", "content": "ok" });',
+    ),
+    { paths: ["/tmp/output.txt"], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets('await tool.write({ "path": ".env", "content": "secret" });'),
+    { paths: [".env"], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets('await tool.write({ "path": "agent://Main", "content": msg });'),
+    { paths: [], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": "agent://Main", "path": "/etc/passwd", "content": msg });',
+    ),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets('await tool.write({ "path": "agent://Main", ...options });'),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets('await tool.write({ "path": "proc://unknown/kill", "content": "x" });'),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets("await tool.write({ \"path\": target, \"content\": 'x' });"),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'function send(tool) { tool.write({ "path": "agent://Main", "content": "message" }); }',
+    ),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+});
+
 test("extracts literal and dynamic Eval working-directory changes", () => {
   assert.deepEqual(
     extractEvalWriteTargets('process.chdir("/etc"); await write("passwd", "secret")'),
@@ -844,7 +885,7 @@ await tool.write({ path: "proc://tgabc/kill" });
   );
 });
 
-test("rejects extra properties, non-tool writes, and protected targets", () => {
+test("rejects extra properties and non-tool writes for Task Group proc calls", () => {
   assertDynamicWrite(`
 const TG_GROUP = "tgabc";
 const TG_PROTOCOL = "omp-task-group/eval-result-v1";
@@ -855,7 +896,6 @@ const TG_GROUP = "tgabc";
 const TG_PROTOCOL = "omp-task-group/eval-result-v1";
 await write({ path: "proc://" + TG_GROUP + "/kill" });
 `);
-  assertDynamicWrite('await tool.write({ path: ".env" });');
 });
 
 test("does not execute expressions while resolving the cancel shape", () => {
