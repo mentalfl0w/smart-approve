@@ -823,9 +823,11 @@ function pushTargetBranches(args: string[]): string[] {
 function isBranchDelete(args: string[]): boolean {
   for (const arg of args) {
     if (arg === "--") break;
-    if (arg === "-D" || arg === "-d" || arg === "--delete") return true;
+    // "-D" force-deletes even unmerged branches; "-d"/"--delete" only delete
+    // merged branches (git refuses otherwise), so only flag the force path.
+    if (arg === "-D" || arg === "--force-delete") return true;
     if (arg.startsWith("-") && !arg.startsWith("--")) {
-      if (arg.includes("d") || arg.includes("D")) return true;
+      if (arg.includes("D")) return true;
     }
   }
   return false;
@@ -1052,7 +1054,14 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
       ) {
         behaviorSet.add("delete-home");
       }
-      if (name === "rmdir" && positional.includes("/")) {
+      // rmdir only removes empty directories; flag it when it targets a
+      // system directory, matching the "delete-sys-dir" path list used for rm.
+      if (
+        name === "rmdir" &&
+        positional.some((target) =>
+          /^\/(?:usr|etc|var|bin|sbin|boot|dev|proc|sys|root|home|Library)(?:\/|$)/i.test(target),
+        )
+      ) {
         behaviorSet.add("recursive-force-delete");
       }
 

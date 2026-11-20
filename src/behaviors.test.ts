@@ -293,6 +293,56 @@ test("parsed command families retain destructive-operation classifications", () 
     assert.ok(analyzeCommand(command).behaviors.includes(behavior), command);
   }
 });
+test("safe branch delete and rmdir paths are not flagged as force deletes", () => {
+  // "git branch -d"/"--delete" only removes merged branches; git refuses
+  // otherwise, so these stay unflagged.
+  for (const command of [
+    "git branch -d feature",
+    "git branch --delete feature",
+    "git branch -md feature",
+    "git branch -ad old-remote",
+  ]) {
+    assert.deepEqual(
+      analyzeCommand(command).behaviors.filter((b) => b === "git-branch-delete"),
+      [],
+      command,
+    );
+  }
+
+  // Only the force path keeps the label.
+  for (const command of [
+    "git branch -D feature",
+    "git branch -fD feature",
+    "git branch --force-delete feature",
+  ]) {
+    assert.ok(
+      analyzeCommand(command).behaviors.includes("git-branch-delete"),
+      command,
+    );
+  }
+
+  // rmdir removes empty directories; flag it only for system directories.
+  for (const command of [
+    "rmdir /tmp/stale-dir",
+    "rmdir -p build/a/b",
+    "rmdir ./old",
+  ]) {
+    assert.deepEqual(
+      analyzeCommand(command).behaviors.filter(
+        (b) => b === "recursive-force-delete",
+      ),
+      [],
+      command,
+    );
+  }
+
+  assert.ok(
+    analyzeCommand("rmdir -p /usr/lib/stale").behaviors.includes(
+      "recursive-force-delete",
+    ),
+  );
+});
+
 
 test("xargs and find execution clauses retain nested command checks", () => {
   const blocked: Array<[string, string]> = [
