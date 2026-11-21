@@ -51,6 +51,7 @@ interface Harness {
   confirmResult: boolean;
   selectResult: string | number | undefined;
   selectChoices: string[][] | null;
+  selectTitle: string | null;
 }
 
 interface HarnessOptions {
@@ -102,8 +103,9 @@ function makeHarness(
       cwd: "/work/project",
       ui: {
         confirm: async () => harness.confirmResult,
-        select: async (_title: string, choices: string[]) => {
+        select: async (title: string, choices: string[]) => {
           harness.selectChoices = [choices];
+          harness.selectTitle = title;
           return harness.selectResult;
         },
         setStatus: () => undefined,
@@ -120,6 +122,7 @@ function makeHarness(
     confirmResult: true,
     selectResult: undefined,
     selectChoices: null,
+    selectTitle: null,
   };
   return harness;
 }
@@ -388,6 +391,61 @@ test("bash: git force push to main is deny-tier", async () => {
   const r = await run(BashToolGate, h, { command: "git push --force origin main" });
   assert.equal(r.isError, true);
   assert.deepEqual(r.details, { blocked: true, reason: "auto" });
+});
+
+test("bash: routine merged branch delete needs no review", async () => {
+  for (const command of ["git branch -d merged-feature", "git branch --delet merged-feature"]) {
+    const h = makeHarness();
+    const r = await run(BashToolGate, h, { command });
+    assert.equal(r.content[0].text, "native-run", command);
+    assert.equal(h.calls.analyze, 0, command);
+    assert.equal(h.calls.delegate, 1, command);
+    assert.equal(h.selectChoices, null, command);
+  }
+});
+
+test("bash: forced branch deletes keep review under the force-delete label", async () => {
+  for (const command of [
+    "git branch -D merged-feature",
+    "git branch -df merged-feature",
+    "git branch -f -d merged-feature",
+    // Git accepts unique long-option abbreviations; they still force a delete.
+    "git branch --delete --forc merged-feature",
+    "git branch --delet --forc merged-feature",
+  ]) {
+    const h = makeHarness();
+    h.selectResult = "Allow for this session";
+    const r = await run(BashToolGate, h, { command });
+    assert.equal(r.content[0].text, "native-run", command);
+    assert.equal(h.calls.analyze, 1, command);
+    assert.match(h.selectTitle ?? "", /git branch -D \(force delete\)/, command);
+  }
+});
+
+test("bash: remote-tracking branch delete keeps review under an accurate label", async () => {
+  for (const command of ["git branch -r -d origin/feature", "git branch --remot -d origin/feature"]) {
+    const h = makeHarness();
+    h.selectResult = "Allow for this session";
+    const r = await run(BashToolGate, h, { command });
+    assert.equal(r.content[0].text, "native-run", command);
+    assert.equal(h.calls.analyze, 1, command);
+    assert.match(h.selectTitle ?? "", /delete remote-tracking branch/, command);
+    assert.doesNotMatch(h.selectTitle ?? "", /force delete/, command);
+  }
+});
+
+test("bash: rmdir root keeps the baseline hard block while ordinary targets pass", async () => {
+  const root = makeHarness();
+  const blocked = await run(BashToolGate, root, { command: "rmdir /" });
+  assert.equal(blocked.isError, true);
+  assert.equal(blockedLabel(blocked), "Recursive force delete (rm -rf)");
+  assert.equal(root.calls.delegate, 0);
+
+  const ordinary = makeHarness();
+  const r = await run(BashToolGate, ordinary, { command: "rmdir /var/empty" });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(ordinary.calls.analyze, 0);
+  assert.equal(ordinary.calls.delegate, 1);
 });
 
 test("bash: abort after analysis returns aborted, no dialog", async () => {

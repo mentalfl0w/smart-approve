@@ -293,57 +293,87 @@ test("parsed command families retain destructive-operation classifications", () 
     assert.ok(analyzeCommand(command).behaviors.includes(behavior), command);
   }
 });
-test("safe branch delete and rmdir paths are not flagged as force deletes", () => {
+test("routine branch deletes stay unflagged; forced and remote-tracking deletes keep review", () => {
   // "git branch -d"/"--delete" only removes merged branches; git refuses
-  // otherwise, so these stay unflagged.
+  // otherwise. A branch named like a flag is only reachable after "--".
   for (const command of [
     "git branch -d feature",
     "git branch --delete feature",
-    "git branch -md feature",
-    "git branch -ad old-remote",
+    "git branch -d -- feature",
+    "git branch -d -- -D",
+    // Abbreviated flags after "--" are branch names too.
+    "git branch --delet -- --forc feature",
+    // "-u" consumes the rest of its cluster as an argument, not flags.
+    "git branch -duf feature",
+    "git branch -m old new",
+    "git branch -c old new",
   ]) {
-    assert.deepEqual(
-      analyzeCommand(command).behaviors.filter((b) => b === "git-branch-delete"),
-      [],
-      command,
-    );
+    assert.deepEqual(analyzeCommand(command).behaviors, [], command);
   }
 
-  // Only the force path keeps the label.
+  // "-D" and any "-d"/"--delete" + "-f"/"--force" combination force the delete.
   for (const command of [
     "git branch -D feature",
-    "git branch -fD feature",
-    "git branch --force-delete feature",
+    "git branch -qD feature",
+    "git branch -df feature",
+    "git branch -fd feature",
+    "git branch -d -f feature",
+    "git branch -f -d feature",
+    "git branch --delete --force feature",
+    "git branch --force --delete feature",
+    // Git accepts unique long-option abbreviations; they force the delete too.
+    "git branch --delete --forc feature",
+    "git branch --delet --forc feature",
+    "git branch --forc --delet feature",
+    "git branch --dele --force feature",
+    "git branch -D -- feature",
   ]) {
-    assert.ok(
-      analyzeCommand(command).behaviors.includes("git-branch-delete"),
-      command,
-    );
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("git-branch-delete"), command);
+    assert.equal(result.hardBlocked, false, command);
   }
 
-  // rmdir removes empty directories; flag it only for system directories.
+  // Remote-tracking deletes keep review under their own accurate label;
+  // they are not force deletes of a local branch.
   for (const command of [
-    "rmdir /tmp/stale-dir",
-    "rmdir -p build/a/b",
-    "rmdir ./old",
+    "git branch -r -d origin/feature",
+    "git branch -d -r origin/feature",
+    "git branch -rd origin/feature",
+    "git branch -rD origin/feature",
+    "git branch --remotes --delete origin/feature",
+    "git branch --delete --remotes origin/feature",
+    // Abbreviated "--remotes"/"--delete" keep the same remote-tracking label.
+    "git branch --remot -d origin/feature",
+    "git branch --dele --remot origin/feature",
   ]) {
-    assert.deepEqual(
-      analyzeCommand(command).behaviors.filter(
-        (b) => b === "recursive-force-delete",
-      ),
-      [],
-      command,
-    );
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("git-branch-delete-remote"), command);
+    assert.ok(!result.behaviors.includes("git-branch-delete"), command);
+    assert.equal(result.hardBlocked, false, command);
   }
-
-  assert.ok(
-    analyzeCommand("rmdir -p /usr/lib/stale").behaviors.includes(
-      "recursive-force-delete",
-    ),
-  );
+  const remoteLabel = analyzeCommand("git branch -r -d origin/feature").labels[0];
+  assert.equal(remoteLabel.en, "git branch -r -d (delete remote-tracking branch)");
+  assert.doesNotMatch(remoteLabel.en, /force/i);
 });
 
+test("rmdir keeps the root hard block without flagging ordinary paths", () => {
+  const root = analyzeCommand("rmdir /");
+  assert.deepEqual(root.behaviors, ["recursive-force-delete"]);
+  assert.equal(root.hardBlocked, true);
 
+  for (const command of [
+    "rmdir /tmp/stale-dir",
+    "rmdir /var/empty",
+    "rmdir -p /usr/lib/stale",
+    "rmdir -p build/a/b",
+    "rmdir ./old",
+    "rmdir -- /tmp/stale-dir",
+  ]) {
+    const result = analyzeCommand(command);
+    assert.deepEqual(result.behaviors, [], command);
+    assert.equal(result.hardBlocked, false, command);
+  }
+});
 test("xargs and find execution clauses retain nested command checks", () => {
   const blocked: Array<[string, string]> = [
     ["echo now | xargs shutdown", "shutdown-reboot"],
