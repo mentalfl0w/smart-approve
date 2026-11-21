@@ -35,6 +35,10 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
   "git-hard-reset": makeLabel("git reset --hard (discard changes)", "git reset --hard 丢弃改动"),
   "git-clean": makeLabel("git clean -f (delete untracked)", "git clean -f 删未跟踪文件"),
   "git-branch-delete": makeLabel("git branch -D (force delete)", "git branch -D 强删分支"),
+  "git-branch-delete-remote": makeLabel(
+    "git branch -r -d (delete remote-tracking branch)",
+    "git branch -r -d 删远程跟踪分支",
+  ),
   "git-tag-delete": makeLabel("git tag -d (delete tag)", "git tag -d 删标签"),
   "git-stash-clear": makeLabel("git stash clear", "git stash clear 清空 stash"),
   "git-stash-drop": makeLabel("git stash drop", "git stash drop 丢 stash"),
@@ -820,15 +824,56 @@ function pushTargetBranches(args: string[]): string[] {
   return branches;
 }
 
-function isBranchDelete(args: string[]): boolean {
+/**
+ * Match a long option by any nonempty leading prefix without "=".
+ *
+ * Git accepts unique option abbreviations ("--delet" for "--delete"), so
+ * equality checks would let "--delet --forc" pass as a routine merged-branch
+ * delete. Prefixes shared by several options are accepted too: git rejects
+ * the ambiguous command itself, so a conservative match cannot misclassify
+ * a command that actually runs.
+ */
+function isLongOptionPrefix(arg: string, option: string): boolean {
+  if (!arg.startsWith("--") || arg.includes("=")) return false;
+  const prefix = arg.slice(2);
+  return prefix.length > 0 && option.startsWith(prefix);
+}
+
+/**
+ * Classify `git branch` deletion flags.
+ *
+ * "-d"/"--delete" alone only removes merged branches (git refuses
+ * otherwise), so it needs no force-delete label. "-D" means
+ * "--delete --force"; "-d" plus "-f"/"--force" in any order is equally
+ * forced; both long forms may be abbreviated like git itself does.
+ * "-r"/"--remotes" selects remote-tracking refs, which get their own
+ * accurate label. Options after "--" are branch names, not flags.
+ */
+function analyzeBranchDelete(args: string[]): string[] {
+  let deleting = false;
+  let force = false;
+  let remotes = false;
   for (const arg of args) {
     if (arg === "--") break;
-    if (arg === "-D" || arg === "-d" || arg === "--delete") return true;
-    if (arg.startsWith("-") && !arg.startsWith("--")) {
-      if (arg.includes("d") || arg.includes("D")) return true;
+    if (isLongOptionPrefix(arg, "delete")) deleting = true;
+    else if (isLongOptionPrefix(arg, "force")) force = true;
+    else if (isLongOptionPrefix(arg, "remotes")) remotes = true;
+    else if (/^-[^-]/.test(arg)) {
+      for (const flag of arg.slice(1)) {
+        if (flag === "d") deleting = true;
+        else if (flag === "D") {
+          deleting = true;
+          force = true;
+        } else if (flag === "f") force = true;
+        else if (flag === "r") remotes = true;
+        // "-u" takes the rest of the cluster as its argument.
+        else if (flag === "u") break;
+      }
     }
   }
-  return false;
+  if (!deleting) return [];
+  if (remotes) return ["git-branch-delete-remote"];
+  return force ? ["git-branch-delete"] : [];
 }
 
 function isGitCleanDestructive(args: string[]): boolean {
@@ -883,7 +928,7 @@ function analyzeGit(args: string[]): string[] {
       return ids;
     }
     case "branch":
-      return isBranchDelete(rest) ? ["git-branch-delete"] : [];
+      return analyzeBranchDelete(rest);
     case "worktree":
       return (rest[0] === "remove" || rest[0] === "rm") ? ["git-worktree-remove"] : [];
     case "reset":
@@ -1052,6 +1097,8 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
       ) {
         behaviorSet.add("delete-home");
       }
+      // rmdir refuses non-empty directories; keep the baseline root-path
+      // hard block instead of flagging every absolute target.
       if (name === "rmdir" && positional.includes("/")) {
         behaviorSet.add("recursive-force-delete");
       }
