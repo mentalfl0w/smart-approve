@@ -393,18 +393,23 @@ test("bash: git force push to main is deny-tier", async () => {
   assert.deepEqual(r.details, { blocked: true, reason: "auto" });
 });
 
-test("bash: routine merged branch delete needs no review", async () => {
-  for (const command of ["git branch -d merged-feature", "git branch --delet merged-feature"]) {
+test("bash: branch deletes need review, including plain -d", async () => {
+  for (const command of [
+    "git branch -d merged-feature",
+    "git branch --delet merged-feature",
+    // Command-local upstream config can make -d discard unmerged commits.
+    "git -c branch.feature.remote=. -c branch.feature.merge=refs/heads/feature branch -d feature",
+  ]) {
     const h = makeHarness();
+    h.selectResult = "Allow for this session";
     const r = await run(BashToolGate, h, { command });
     assert.equal(r.content[0].text, "native-run", command);
-    assert.equal(h.calls.analyze, 0, command);
-    assert.equal(h.calls.delegate, 1, command);
-    assert.equal(h.selectChoices, null, command);
+    assert.equal(h.calls.analyze, 1, command);
+    assert.match(h.selectTitle ?? "", /git branch -d\/-D \(delete local branch\)/, command);
   }
 });
 
-test("bash: forced branch deletes keep review under the force-delete label", async () => {
+test("bash: forced branch deletes keep review", async () => {
   for (const command of [
     "git branch -D merged-feature",
     "git branch -df merged-feature",
@@ -418,7 +423,7 @@ test("bash: forced branch deletes keep review under the force-delete label", asy
     const r = await run(BashToolGate, h, { command });
     assert.equal(r.content[0].text, "native-run", command);
     assert.equal(h.calls.analyze, 1, command);
-    assert.match(h.selectTitle ?? "", /git branch -D \(force delete\)/, command);
+    assert.match(h.selectTitle ?? "", /git branch -d\/-D \(delete local branch\)/, command);
   }
 });
 

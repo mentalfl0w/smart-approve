@@ -293,24 +293,45 @@ test("parsed command families retain destructive-operation classifications", () 
     assert.ok(analyzeCommand(command).behaviors.includes(behavior), command);
   }
 });
-test("routine branch deletes stay unflagged; forced and remote-tracking deletes keep review", () => {
-  // "git branch -d"/"--delete" only removes merged branches; git refuses
-  // otherwise. A branch named like a flag is only reachable after "--".
+test("local branch deletes need review, including plain -d", () => {
+  // "-d" is not proof of safety: git checks branch.<name>.merge against the
+  // configured upstream rather than HEAD, so command-local `-c` config can
+  // make an unmerged branch look merged and let -d discard its commits.
   for (const command of [
     "git branch -d feature",
     "git branch --delete feature",
+    "git branch --delet feature",
     "git branch -d -- feature",
     "git branch -d -- -D",
     // Abbreviated flags after "--" are branch names too.
     "git branch --delet -- --forc feature",
     // "-u" consumes the rest of its cluster as an argument, not flags.
     "git branch -duf feature",
+    // The reported bypass: a command-local upstream makes -d drop commits
+    // that HEAD cannot reach.
+    "git -c branch.feature.remote=. -c branch.feature.merge=refs/heads/feature branch -d feature",
+    "git -c branch.feature.remote=origin -c branch.feature.merge=refs/heads/other branch --delete feature",
+  ]) {
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("git-branch-delete"), command);
+    assert.equal(result.hardBlocked, false, command);
+  }
+});
+
+test("non-deleting branch commands stay unflagged", () => {
+  for (const command of [
     "git branch -m old new",
     "git branch -c old new",
+    "git branch -u origin/main",
+    "git branch --set-upstream-to=origin/main feature",
+    "git branch -a",
+    "git branch --list feature",
   ]) {
     assert.deepEqual(analyzeCommand(command).behaviors, [], command);
   }
+});
 
+test("forced branch deletes keep review; remote-tracking deletes get their own label", () => {
   // "-D" and any "-d"/"--delete" + "-f"/"--force" combination force the delete.
   for (const command of [
     "git branch -D feature",

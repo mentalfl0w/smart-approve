@@ -128,7 +128,8 @@ Matches executable names, parsed arguments, and filesystem targets instead of se
 |---|---|---|
 | `git push origin +main` | force-push | `+`refspec, not just `--force` |
 | `git push -f origin main` | force-push to protected branch | deny tier (branch-aware) |
-| `git branch -D feature` | branch-delete | `-D`, or `-d`/`--delete` with `-f`/`--force`; plain `-d` stays unflagged |
+| `git branch -d feature` | branch-delete | every local delete needs review: `-d` checks the branch's configured upstream, not `HEAD`, so `-c branch.<name>.remote`/`.merge` can make it discard commits `HEAD` cannot reach |
+| `git branch -D feature` | branch-delete | forced delete (`-D`, or `-d`/`--delete` with `-f`/`--force`) |
 | `git branch -r -d origin/feature` | branch-delete-remote | remote-tracking refs get their own label |
 | `git clean -fd` | git-clean | `--dry-run` excluded |
 | `git reset --hard` | hard-reset | `--hard` flag |

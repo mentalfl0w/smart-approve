@@ -34,7 +34,10 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
   "git-push-colon-ref": makeLabel("git push :ref (delete remote branch)", "git push :ref 删远程分支"),
   "git-hard-reset": makeLabel("git reset --hard (discard changes)", "git reset --hard 丢弃改动"),
   "git-clean": makeLabel("git clean -f (delete untracked)", "git clean -f 删未跟踪文件"),
-  "git-branch-delete": makeLabel("git branch -D (force delete)", "git branch -D 强删分支"),
+  "git-branch-delete": makeLabel(
+    "git branch -d/-D (delete local branch)",
+    "git branch -d/-D 删除本地分支",
+  ),
   "git-branch-delete-remote": makeLabel(
     "git branch -r -d (delete remote-tracking branch)",
     "git branch -r -d 删远程跟踪分支",
@@ -828,8 +831,8 @@ function pushTargetBranches(args: string[]): string[] {
  * Match a long option by any nonempty leading prefix without "=".
  *
  * Git accepts unique option abbreviations ("--delet" for "--delete"), so
- * equality checks would let "--delet --forc" pass as a routine merged-branch
- * delete. Prefixes shared by several options are accepted too: git rejects
+ * equality checks would let "--delet --forc" slip past the plain-delete
+ * review. Prefixes shared by several options are accepted too: git rejects
  * the ambiguous command itself, so a conservative match cannot misclassify
  * a command that actually runs.
  */
@@ -842,29 +845,25 @@ function isLongOptionPrefix(arg: string, option: string): boolean {
 /**
  * Classify `git branch` deletion flags.
  *
- * "-d"/"--delete" alone only removes merged branches (git refuses
- * otherwise), so it needs no force-delete label. "-D" means
- * "--delete --force"; "-d" plus "-f"/"--force" in any order is equally
- * forced; both long forms may be abbreviated like git itself does.
+ * Every local branch delete needs review, including plain "-d"/"--delete".
+ * Git does not require `-d` to be merged into HEAD: it checks the branch's
+ * configured upstream (`branch.<name>.remote`/`.merge`), which command-local
+ * `-c` config can point anywhere. A merged-looking delete can therefore
+ * discard commits that HEAD cannot reach. "-D" and "-f"/"--force" force the
+ * delete; both long forms may be abbreviated like git itself does.
  * "-r"/"--remotes" selects remote-tracking refs, which get their own
  * accurate label. Options after "--" are branch names, not flags.
  */
 function analyzeBranchDelete(args: string[]): string[] {
   let deleting = false;
-  let force = false;
   let remotes = false;
   for (const arg of args) {
     if (arg === "--") break;
     if (isLongOptionPrefix(arg, "delete")) deleting = true;
-    else if (isLongOptionPrefix(arg, "force")) force = true;
     else if (isLongOptionPrefix(arg, "remotes")) remotes = true;
     else if (/^-[^-]/.test(arg)) {
       for (const flag of arg.slice(1)) {
-        if (flag === "d") deleting = true;
-        else if (flag === "D") {
-          deleting = true;
-          force = true;
-        } else if (flag === "f") force = true;
+        if (flag === "d" || flag === "D") deleting = true;
         else if (flag === "r") remotes = true;
         // "-u" takes the rest of the cluster as its argument.
         else if (flag === "u") break;
@@ -873,7 +872,7 @@ function analyzeBranchDelete(args: string[]): string[] {
   }
   if (!deleting) return [];
   if (remotes) return ["git-branch-delete-remote"];
-  return force ? ["git-branch-delete"] : [];
+  return ["git-branch-delete"];
 }
 
 function isGitCleanDestructive(args: string[]): boolean {
