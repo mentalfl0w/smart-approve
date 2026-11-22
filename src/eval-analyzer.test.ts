@@ -16,6 +16,8 @@ const RISK = "eval-risky-process";
 const CWD = "eval-sensitive-working-directory";
 const UNRESOLVED_SHELL_CWD = "eval-unresolved-shell-cwd";
 const EXTERNAL_SOURCE = "eval-external-source";
+const MCP = "eval-mcp-tool-invocation";
+const DYNAMIC_HOST = "eval-dynamic-host-tool-invocation";
 const EMPTY = { behaviors: [], labels: [], hardBlocked: false, denyTier: false } as const;
 
 // ── Bun JS spawn APIs ────────────────────────────────────────────────
@@ -748,6 +750,80 @@ test("extracts object-form tool.write paths when content is a dynamic expression
     ),
     { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
   );
+});
+
+test("flags direct MCP tool calls in JS and Python", () => {
+  const cases: Array<[string, string]> = [
+    ["await tool.mcp__ssh_manager_ssh_execute({ server: 'x', command: 'uname -a' });", "js"],
+    ["await tool.mcp__context_mode_ctx_execute({'language':'shell','code':'ls'})", "py"],
+    ["await globalThis.tool.mcp__x({})", "js"],
+    ["await self.tool.mcp__x({})", "js"],
+    ['await tool["mcp__x"]({})', "js"],
+    ["await tool?.mcp__x({})", "js"],
+  ];
+  for (const [code, language] of cases) {
+    const r = analyzer.analyze(code, language);
+    assert.ok(r.behaviors.includes(MCP), code);
+    assert.equal(r.denyTier, true, code);
+    assert.equal(r.hardBlocked, false, code);
+    assert.equal(r.requiresConfirmation, undefined, code);
+  }
+});
+
+test("ignores MCP-looking text in comments and strings and prelude helper methods", () => {
+  for (const code of [
+    "// await tool.mcp__x({})\nconst x = 1;",
+    "const note = 'await tool.mcp__x({})';",
+    "const note = `await tool.mcp__x({})`;",
+    "tool.defined(); tool.undefine('x');",
+    "await tool.read({ path: 'a.txt' });",
+    "await tool.write({ path: 'xd://mcp__x', content: 'x' });",
+  ]) {
+    const r = analyzer.analyze(code, "js");
+    assert.ok(!r.behaviors.includes(MCP), code);
+    assert.ok(!r.behaviors.includes(DYNAMIC_HOST), code);
+  }
+});
+
+const MCP_NAMESPACE_CONTEXT = {
+  mcpServerNames: new Set(["github", "ssh_manager"]),
+  mcpToolNames: new Set(["mcp__github_create_issue"]),
+};
+
+test("flags OMP MCP namespace calls recognized from the host inventory", () => {
+  const cases: Array<[string, string]> = [
+    ["await github.create_issue({ title: 'x' })", "js"],
+    ["await globalThis.github.create_issue({ title: 'x' })", "js"],
+    ["await github.create_issue({'title':'x'})", "py"],
+    ['await github["create_issue"]({ title: "x" })', "js"],
+    ["await ssh_manager.ssh_execute(server='x', command='uname')", "py"],
+  ];
+  for (const [code, language] of cases) {
+    const r = analyzer.analyze(code, language, undefined, undefined, MCP_NAMESPACE_CONTEXT);
+    assert.ok(r.behaviors.includes(MCP), code);
+    assert.equal(r.denyTier, true, code);
+    assert.equal(r.hardBlocked, false, code);
+  }
+});
+
+test("does not guess MCP namespaces without a host inventory", () => {
+  assert.deepEqual(analyzer.analyze("await github.create_issue({ title: 'x' })", "js"), EMPTY);
+});
+
+test("requires confirmation for dynamic host-tool and namespace dispatch", () => {
+  const cases: Array<[string, string]> = [
+    ["await tool[name]({})", "js"],
+    ["await tool[name](args)", "py"],
+    ["await github[method]({})", "js"],
+    ['globalThis.__omp_call_tool__("__mcp__", { tool, args })', "js"],
+    ['_bridge_call("__mcp__", {"tool": tool, "args": args})', "py"],
+  ];
+  for (const [code, language] of cases) {
+    const r = analyzer.analyze(code, language, undefined, undefined, MCP_NAMESPACE_CONTEXT);
+    assert.ok(r.behaviors.includes(DYNAMIC_HOST), code);
+    assert.equal(r.requiresConfirmation, true, code);
+    assert.equal(r.hardBlocked, false, code);
+  }
 });
 
 test("detects write helpers hidden inside template and f-string interpolation", () => {

@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { ExtensionCtx, AgentToolResult, RiskAnalysis } from "./types.ts";
+import type { ExtensionCtx, AgentToolResult, HostToolInfo, RiskAnalysis } from "./types.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -58,6 +58,7 @@ interface HarnessOptions {
   hasUI?: boolean;
   isAllowed?: boolean;
   analyzeResult?: RiskAnalysis | null;
+  hostTools?: readonly HostToolInfo[];
 }
 
 function makeHarness(
@@ -97,6 +98,7 @@ function makeHarness(
       protectedPathMatcher: {
         isProtected: (filePath: string) => filePath === ".env" || filePath.endsWith("/.env"),
       },
+      hostTools: opts.hostTools ? () => opts.hostTools! : undefined,
     },
     ctx: {
       hasUI: opts.hasUI ?? true,
@@ -551,6 +553,84 @@ test("eval: auto mode sends object tool.write host-tool invocations to AI review
   assert.equal(reasonOf(denied), "auto");
   assert.equal(blocked.calls.analyze, 1);
   assert.equal(blocked.calls.delegate, 0);
+});
+
+test("eval: direct MCP calls are reviewed by the model in auto mode", async () => {
+  const code =
+    "await tool.mcp__ssh_manager_ssh_execute(" +
+    "{server:'raspberrypicm4',command:'uname -a'})";
+  const allowed = makeHarness({ mode: "auto" });
+  const ok = await run(EvalToolGate, allowed, { language: "js", code });
+  assert.equal(ok.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+  assert.equal(allowed.selectChoices, null);
+
+  const blocked = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "allow" } },
+  );
+  const denied = await run(EvalToolGate, blocked, { language: "js", code });
+  assert.equal(denied.isError, true);
+  assert.equal(reasonOf(denied), "auto");
+  assert.equal(blocked.calls.analyze, 1);
+  assert.equal(blocked.calls.delegate, 0);
+});
+
+test("eval: direct MCP calls cannot be auto-allowed without a model verdict", async () => {
+  const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const r = await run(EvalToolGate, h, {
+    language: "py",
+    code: "await tool.mcp__ssh_manager_ssh_execute({'server':'x','command':'id'})",
+  });
+  assert.equal(r.isError, true);
+  assert.equal(reasonOf(r), "auto");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 0);
+});
+
+test("eval: MCP namespace calls use the live host tool inventory", async () => {
+  const h = makeHarness(
+    { mode: "auto" },
+    {
+      hostTools: [{
+        name: "mcp__github_create_issue",
+        mcpServerName: "github",
+        mcpToolName: "create_issue",
+      }],
+    },
+  );
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: "await github.create_issue({ title: 'x' })",
+  });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+});
+
+test("eval: dynamic host-tool dispatch requires confirmation, not model review", async () => {
+  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: "await tool[name]({})",
+  });
+  assert.equal(r.isError, true);
+  assert.equal(reasonOf(r), "no-ui");
+  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.calls.delegate, 0);
+});
+
+test("eval: xd host-tool writes cannot be auto-allowed without a model verdict", async () => {
+  const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: "await tool.write({path:'xd://mcp__x',content:'{}'})",
+  });
+  assert.equal(r.isError, true);
+  assert.equal(reasonOf(r), "auto");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 0);
 });
 
 test("eval: template-interpolated content cannot hide a system write", async () => {

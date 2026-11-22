@@ -33,6 +33,14 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
     "子进程调用携带危险载荷",
   ),
   "eval-risky-process": makeLabel("Spawns a high-risk executable or uses dangerous process arguments", "启动高风险程序或带有危险进程参数"),
+  "eval-mcp-tool-invocation": makeLabel(
+    "Invokes an MCP tool from Eval code",
+    "Eval 代码调用 MCP 工具",
+  ),
+  "eval-dynamic-host-tool-invocation": makeLabel(
+    "Calls a host tool through a name that cannot be resolved statically",
+    "Eval 代码通过无法静态确定的名称调用宿主工具",
+  ),
   "eval-sensitive-working-directory": makeLabel(
     "Changes into a sensitive system directory",
     "切换到敏感系统目录",
@@ -1059,6 +1067,140 @@ function readToolWriteObjectPath(
   return undefined;
 }
 
+/** MCP capability inventory supplied by the host for one Eval analysis. */
+export interface EvalHostToolContext {
+  /** Registered MCP tool names callable as `tool.<name>`. */
+  mcpToolNames?: ReadonlySet<string>;
+  /** MCP server names exposed as Eval namespace globals. */
+  mcpServerNames?: ReadonlySet<string>;
+}
+
+interface HostToolCallScan {
+  /** A statically identified MCP call (`tool.mcp__x` or `server.method`). */
+  mcp: boolean;
+  /** A host tool or bridge was dispatched through an unresolved name. */
+  dynamic: boolean;
+}
+
+/** Prelude methods on the kernel-local `tool` helper, not session tools. */
+const TOOL_HELPER_METHODS: Record<string, true> = {
+  defined: true,
+  undefine: true,
+};
+
+/** Direct kernels for host dispatch.  `__omp_call_tool__` is the JS bridge
+ *  the prelude itself uses; `_bridge_call` is its Python counterpart. */
+const HOST_BRIDGE_CALL = /\b(?:__omp_call_tool__|_bridge_call)\s*\(/g;
+
+const TOOL_TOKEN = /(?:\b(?:globalThis|global|self)\s*\.\s*)?\btool\b/g;
+
+/** Parse `.<name>`, `?.<name>`, `["<name>"]`, or a dynamic subscript after
+ *  the `tool` token.  Offsets stay aligned between the code and string views. */
+function readToolMember(
+  view: StaticStringView,
+  cursor: number,
+): { name?: string; dynamic: boolean } | undefined {
+  cursor = skipStaticWhitespace(view.code, cursor);
+  const optional = view.code.startsWith("?.", cursor);
+  if (optional) cursor = skipStaticWhitespace(view.code, cursor + 2);
+  if (view.code[cursor] === ".") {
+    cursor = skipStaticWhitespace(view.code, cursor + 1);
+    const identifier = readStaticIdentifier(view.code, cursor);
+    return identifier ? { name: identifier.name, dynamic: false } : undefined;
+  }
+  if (view.code[cursor] === "[") {
+    const inner = skipStaticWhitespace(view.text, cursor + 1);
+    const literal = readStaticString(view.text, inner);
+    if (!literal) return { dynamic: true };
+    const closing = skipStaticWhitespace(view.text, literal.end);
+    if (view.text[closing] !== "]") return { dynamic: true };
+    return { name: literal.value, dynamic: false };
+  }
+  if (optional) {
+    const identifier = readStaticIdentifier(view.code, cursor);
+    return identifier ? { name: identifier.name, dynamic: false } : undefined;
+  }
+  return undefined;
+}
+
+/** Recognize MCP reachable through `tool.<name>` and host-tool dispatch with a
+ *  name the analyzer cannot resolve.  Non-MCP session tools keep their own
+ *  approval gates; only unresolved dispatch is raised here because no gate can
+ *  attribute it to a concrete tool. */
+function scanToolBridgeCalls(
+  view: StaticStringView,
+  context?: EvalHostToolContext,
+): HostToolCallScan {
+  let mcp = false;
+  let dynamic = false;
+
+  TOOL_TOKEN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = TOOL_TOKEN.exec(view.code)) !== null) {
+    // Do not treat `other.tool` as the kernel prelude.
+    if (match.index > 0 && /[\w$.]/.test(view.code[match.index - 1])) continue;
+    const member = readToolMember(view, match.index + match[0].length);
+    if (!member) continue;
+    if (member.dynamic) {
+      dynamic = true;
+      continue;
+    }
+    const name = member.name;
+    if (!name) continue;
+    // `tool.write` file/host targets are extracted separately so their
+    // protected-path checks keep their existing semantics.
+    if (name === "write") continue;
+    if (TOOL_HELPER_METHODS[name]) continue;
+    if (name.startsWith("mcp__") || context?.mcpToolNames?.has(name) === true) {
+      mcp = true;
+      continue;
+    }
+    // Other concrete session tools are left to their own gates.
+  }
+
+  HOST_BRIDGE_CALL.lastIndex = 0;
+  if (HOST_BRIDGE_CALL.test(view.code)) dynamic = true;
+
+  return { mcp, dynamic };
+}
+
+/** Recognize MCP namespace calls such as `github.create_issue(...)` that OMP
+ *  exposes when `mcp.evalNamespaces` binds MCP servers to Eval globals. */
+function scanMcpNamespaceCalls(
+  view: StaticStringView,
+  context?: EvalHostToolContext,
+): HostToolCallScan {
+  let mcp = false;
+  let dynamic = false;
+  const servers = [...(context?.mcpServerNames ?? [])].filter((name) =>
+    /^[A-Za-z_$][\w$]*$/.test(name),
+  );
+  if (servers.length === 0) return { mcp, dynamic };
+
+  const alternation = servers
+    .sort((a, b) => b.length - a.length)
+    .map(escapeStaticRegExp)
+    .join("|");
+  const token = new RegExp(
+    `(?:\\b(?:globalThis|global|self)\\s*\\.\\s*)?\\b(?:${alternation})\\b`,
+    "g",
+  );
+  token.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = token.exec(view.code)) !== null) {
+    // A namespace is a global, never a property of another object.
+    if (match.index > 0 && /[\w$.]/.test(view.code[match.index - 1])) continue;
+    const member = readToolMember(view, match.index + match[0].length);
+    if (!member) continue;
+    if (member.dynamic) {
+      dynamic = true;
+      continue;
+    }
+    if (member.name) mcp = true;
+  }
+  return { mcp, dynamic };
+}
+
 /** Static file-write and host-tool targets from Eval helpers, Python magics, and common file APIs. */
 export function extractEvalWriteTargets(code: string, language?: string): EvalWriteTargets {
   const source = String(code ?? "");
@@ -1393,10 +1535,12 @@ export class EvalCodeBehaviorAnalyzer {
     language?: string,
     baseCwd?: string,
     sessionCwd?: string,
+    hostContext?: EvalHostToolContext,
   ): DangerAnalysis {
     const source = String(code ?? "");
     const withStrings = scrub(source, true);
     const scrubbed = scrub(source, false);
+    const view: StaticStringView = { text: withStrings, code: scrubbed };
     const pythonScan = isPythonLanguage(language)
       ? scanPythonMagics(source, scrubbed, withStrings)
       : undefined;
@@ -1406,6 +1550,19 @@ export class EvalCodeBehaviorAnalyzer {
       : path.join(base, ".smart-approve-standalone-session");
 
     const found = new Set<string>();
+    // Python magics execute through the shell, not the JS/Python object graph;
+    // scan the masked view so `!echo tool.mcp__x` is not read as a bridge call.
+    const hostView: StaticStringView = pythonScan
+      ? { text: withStrings, code: pythonScan.maskedCode }
+      : view;
+    const bridgeScan = scanToolBridgeCalls(hostView, hostContext);
+    const namespaceScan = scanMcpNamespaceCalls(hostView, hostContext);
+    if (bridgeScan.mcp || namespaceScan.mcp) {
+      found.add("eval-mcp-tool-invocation");
+    }
+    if (bridgeScan.dynamic || namespaceScan.dynamic) {
+      found.add("eval-dynamic-host-tool-invocation");
+    }
     const childProcessImport =
       CHILD_PROCESS_IMPORT.test(withStrings) ||
       /(?:__import__|importlib\.import_module)\s*\(\s*["']subprocess["']/.test(withStrings);
@@ -1515,7 +1672,9 @@ export class EvalCodeBehaviorAnalyzer {
     if (shellUnresolvedCwd) found.add("eval-unresolved-shell-cwd");
 
     const requiresConfirmation =
-      shellUnresolvedCwd || pythonScan?.externalSource === true;
+      shellUnresolvedCwd ||
+      pythonScan?.externalSource === true ||
+      found.has("eval-dynamic-host-tool-invocation");
     if (pythonScan?.externalSource) found.add("eval-external-source");
 
     const hardBlocked =
@@ -1527,7 +1686,9 @@ export class EvalCodeBehaviorAnalyzer {
       behaviors,
       labels,
       hardBlocked,
-      denyTier: false,
+      // A statically identified MCP call has no regex-level safe/unsafe verdict.
+      // When no model verdict is available, auto mode must not infer safety.
+      denyTier: found.has("eval-mcp-tool-invocation"),
     };
     return requiresConfirmation ? { ...analysis, requiresConfirmation: true } : analysis;
   }
