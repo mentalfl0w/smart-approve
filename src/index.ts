@@ -181,6 +181,7 @@ class SmartApprove {
       lang: this.lang,
       t: this.t,
       protectedPathMatcher: this.pathMatcher,
+      hostTools: () => this.pi.getAllTools?.() ?? [],
     };
     const bashGate = new BashToolGate(shared);
     const evalGate = new EvalToolGate(shared);

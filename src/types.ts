@@ -123,6 +123,10 @@ export interface HostToolInfo {
   description?: string;
   parameters?: unknown;
   sourceInfo?: { source?: string };
+  /** MCP metadata supplied by OMP for MCP-backed session tools. */
+  mcpServerName?: string;
+  mcpToolName?: string;
+  mcpReadOnlyHint?: boolean;
 }
 
 /** Optional model registry surface; Pi and OMP provide different capabilities. */

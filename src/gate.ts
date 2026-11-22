@@ -66,6 +66,10 @@ export interface GateDeps {
   lang: Lang;
   t: I18n;
   protectedPathMatcher?: { isProtected(filePath: string, baseCwd?: string): boolean };
+  /** Live host tool inventory.  Eval uses it to recognize nested MCP calls
+   *  and MCP namespace globals; read lazily because MCP tools connect after
+   *  session start. */
+  hostTools?: () => readonly HostToolInfo[];
 }
 
 export type GateAuthorization =
