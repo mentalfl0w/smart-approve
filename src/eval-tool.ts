@@ -65,6 +65,7 @@ export class EvalToolGate extends ToolGate {
     const unresolvedCwd = isUnresolvedCwd(cwd);
     const analysis = this.analyzer.analyze(subject, language, cwd, sessionCwd);
     const writeTargets = extractEvalWriteTargets(subject, language);
+    const hostToolTargets = writeTargets.hostToolTargets ?? [];
     const writeCwds = unresolvedCwd ? [sessionCwd] : [cwd];
     let currentCwd: string | undefined = unresolvedCwd ? undefined : cwd;
     let sensitiveCwd = false;
@@ -105,6 +106,9 @@ export class EvalToolGate extends ToolGate {
     let denyTier = analysis.denyTier;
 
     if (sensitiveCwd) behaviors.add("eval-sensitive-working-directory");
+    // `xd://` writes are host-tool invocations, not filesystem writes; keep
+    // them reviewable so the model sees the tool name and its arguments.
+    if (hostToolTargets.length > 0) behaviors.add("eval-host-tool-invocation");
 
     for (const target of writeTargets.paths) {
       const candidates = writeCwds.flatMap((writeCwd) =>
@@ -153,6 +157,12 @@ export class EvalToolGate extends ToolGate {
     }
     if (behaviors.has("eval-protected-file-write")) {
       labels.push(makeLabel("Writes a protected file from Eval code", "Eval 代码写入受保护文件"));
+    }
+    if (behaviors.has("eval-host-tool-invocation")) {
+      labels.push(makeLabel(
+        "Invokes a host tool from Eval code",
+        "Eval 代码调用宿主工具",
+      ));
     }
     if (dynamicWrite) {
       labels.push(makeLabel(

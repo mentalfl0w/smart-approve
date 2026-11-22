@@ -7,7 +7,7 @@ Covered execution surfaces:
 | Tool | Mechanism | Dangerous-op handling |
 |---|---|---|
 | `bash` | OMP: same-name wrapper with native schema; Pi: `tool_call` gate | command analysis + LLM policy + interactive confirmation or auto verdict |
-| `eval` | OMP: same-name wrapper with native schema; Pi: `tool_call` gate when present | static subprocess and protected-file-write analysis |
+| `eval` | OMP: same-name wrapper with native schema; Pi: `tool_call` gate when present | static subprocess, host-tool invocation, and protected-file-write analysis |
 | `write` / `edit` / `apply_patch` / `ast_edit` | `tool_call` target matching | system-sensitive files/devices hard-block; configured protected paths require confirmation |
 | `write proc://<name>` (OMP) | `tool_call` check for tracked interactive services | shell input always gated; Python/JavaScript also gated when Eval coverage is enabled |
 
@@ -178,7 +178,7 @@ Force-push to a protected branch stays deny tier, distinct from these hard block
 Matching is **symlink-aware** for file paths. `apply_patch` targets are extracted from patch headers; `edit` uses the host's derived `path`/`paths`; `ast_edit` checks explicit `paths` before its staged preview.
 
 OMP Eval's `write(path, content)` helper writes directly from the retained runtime and does not emit a `write` tool call. Smart Approve checks literal targets for `write`, `Bun.write`, `writeFile`, and `open(..., "w"/"a"/"x")`. A protected literal target always asks for user confirmation, including in auto mode. A computed target also requires confirmation; headless calls are blocked.
-- OMP Eval's `tool.write({ path, content })` object form checks literal filesystem paths against protected-path rules. `agent://`, `xd://`, and `out://` targets are not filesystem paths; computed/unknown targets or unsupported object shapes still require confirmation. `proc://` remains confirmation-required except for the verified Task Group pool-cancel form.
+- OMP Eval's `tool.write({ path, content })` object form checks literal filesystem paths against protected-path rules. `agent://`, `xd://`, and `out://` targets are not filesystem paths; `xd://` host-tool invocations are reviewable and go through model analysis. Computed/unknown targets or unsupported object shapes still require confirmation. `proc://` remains confirmation-required except for the verified Task Group pool-cancel form.
 
 ### 5. Decision memory
 

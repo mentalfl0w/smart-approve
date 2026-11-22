@@ -49,19 +49,48 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
 
 // ── Comment / string scrubbing ───────────────────────────────────────
 
+interface ScrubRegion {
+  text: string;
+  end: number;
+}
+
 /**
- * Return `code` with comments (and, unless `keepStrings`, string/template
- * literals) replaced by spaces.  Newlines are preserved so patterns can
- * never span unrelated lines, and replaced characters keep their width so
- * token boundaries stay intact.
- *
- * `#` is only treated as a comment start when it is not preceded by a word
- * character or `.`, which keeps JS private-field syntax (`this.#x`) intact.
+ * True for a Python f-string prefix ending immediately before `quoteIndex`.
+ * f-string replacement fields are executable, unlike plain string values.
  */
-function scrub(code: string, keepStrings: boolean): string {
+function hasFStringPrefix(code: string, quoteIndex: number): boolean {
+  let start = quoteIndex;
+  while (start > 0 && /[A-Za-z]/.test(code[start - 1])) start--;
+  if (start === quoteIndex) return false;
+  if (start > 0 && /[\w$]/.test(code[start - 1])) return false;
+  return /^[rRbBuU]*[fF][rRbBuU]*$/.test(code.slice(start, quoteIndex));
+}
+
+/**
+ * Scrub one region of `code`, preserving its width and newlines.  Comments
+ * and (unless `keepStrings`) string literals become spaces.
+ *
+ * Template-literal interpolations (`${...}`) and Python f-string replacement
+ * fields (`{...}`) are kept executable: they run in the cell, so blanking
+ * them would hide write/spawn/chdir calls from the analyzers.  When
+ * `stopAtBrace` is set, the scan stops after the `}` that closes such an
+ * interpolation and returns it.
+ *
+ * An unescaped `/` inside an interpolation may start a regex literal whose
+ * braces and quotes are not tracked here.  In that case the remaining source
+ * is copied verbatim so executable code can never be blanked as template
+ * text; the extra text is a conservative over-approximation.
+ */
+function scrubRegion(
+  code: string,
+  start: number,
+  keepStrings: boolean,
+  stopAtBrace: boolean,
+): ScrubRegion {
   const out: string[] = [];
-  let i = 0;
   const n = code.length;
+  let braceDepth = 0;
+  let i = start;
 
   while (i < n) {
     const c = code[i];
@@ -88,6 +117,10 @@ function scrub(code: string, keepStrings: boolean): string {
       }
       continue;
     }
+    if (!keepStrings && stopAtBrace && c === "/") {
+      out.push(code.slice(i));
+      return { text: out.join(""), end: n };
+    }
     if (c === "#" && !/[\w]/.test(code[i - 1] ?? "") && code[i - 1] !== ".") {
       while (i < n && code[i] !== "\n") {
         out.push(" ");
@@ -95,9 +128,9 @@ function scrub(code: string, keepStrings: boolean): string {
       }
       continue;
     }
-    if (c === "'" || c === '"' || c === "`") {
-      const quote = c;
-      out.push(keepStrings ? quote : " ");
+    if (c === "'" || c === '"') {
+      const fString = !keepStrings && hasFStringPrefix(code, i);
+      out.push(keepStrings ? c : " ");
       i++;
       while (i < n) {
         if (code[i] === "\\") {
@@ -109,10 +142,18 @@ function scrub(code: string, keepStrings: boolean): string {
           i += 2;
           continue;
         }
-        if (code[i] === quote) {
-          out.push(keepStrings ? quote : " ");
+        if (code[i] === c) {
+          out.push(keepStrings ? c : " ");
           i++;
           break;
+        }
+        if (fString && code[i] === "{") {
+          out.push("{");
+          i++;
+          const inner = scrubRegion(code, i, false, true);
+          out.push(inner.text);
+          i = inner.end;
+          continue;
         }
         if (keepStrings) {
           out.push(code[i]);
@@ -123,10 +164,89 @@ function scrub(code: string, keepStrings: boolean): string {
       }
       continue;
     }
+    if (c === "`") {
+      if (keepStrings) {
+        out.push(c);
+        i++;
+        while (i < n) {
+          if (code[i] === "\\") {
+            out.push(code[i], code[i + 1] ?? " ");
+            i += 2;
+            continue;
+          }
+          if (code[i] === "`") {
+            out.push("`");
+            i++;
+            break;
+          }
+          out.push(code[i]);
+          i++;
+        }
+      } else {
+        out.push(" ");
+        i++;
+        while (i < n) {
+          if (code[i] === "\\") {
+            out.push("  ");
+            i += 2;
+            continue;
+          }
+          if (code[i] === "`") {
+            out.push(" ");
+            i++;
+            break;
+          }
+          if (code[i] === "$" && code[i + 1] === "{") {
+            out.push("$", "{");
+            i += 2;
+            const inner = scrubRegion(code, i, false, true);
+            out.push(inner.text);
+            i = inner.end;
+            continue;
+          }
+          out.push(code[i] === "\n" ? "\n" : " ");
+          i++;
+        }
+      }
+      continue;
+    }
+    if (!keepStrings && stopAtBrace) {
+      if (c === "{") {
+        braceDepth++;
+        out.push(c);
+        i++;
+        continue;
+      }
+      if (c === "}") {
+        if (braceDepth === 0) {
+          out.push("}");
+          i++;
+          return { text: out.join(""), end: i };
+        }
+        braceDepth--;
+        out.push(c);
+        i++;
+        continue;
+      }
+    }
     out.push(c);
     i++;
   }
-  return out.join("");
+  return { text: out.join(""), end: i };
+}
+
+/**
+ * Return `code` with comments (and, unless `keepStrings`, string literals)
+ * replaced by spaces.  Newlines are preserved so patterns can never span
+ * unrelated lines, and replaced characters keep their width so token
+ * boundaries stay intact.  Template/f-string interpolation code stays
+ * visible because it is executed by the cell.
+ *
+ * `#` is only treated as a comment start when it is not preceded by a word
+ * character or `.`, which keeps JS private-field syntax (`this.#x`) intact.
+ */
+function scrub(code: string, keepStrings: boolean): string {
+  return scrubRegion(code, 0, keepStrings, false).text;
 }
 
 export interface EvalWriteTargets {
@@ -134,6 +254,8 @@ export interface EvalWriteTargets {
   dynamic: boolean;
   cwdPaths: string[];
   cwdDynamic: boolean;
+  /** `xd://` host-tool invocations; these are not filesystem paths. */
+  hostToolTargets?: string[];
 }
 
 /** OMP magic syntax belongs to Python cells only. */
@@ -506,10 +628,14 @@ const TASK_GROUP_PROTOCOL = "omp-task-group/eval-result-v1";
 const TASK_GROUP_ID = /^tg[a-z0-9]+$/;
 
 const TASK_GROUP_PROC_WRITE = /\btool\s*\.\s*write\s*\(/g;
+/** Virtual destinations that are neither files nor host-tool calls. */
 const NON_FILE_TOOL_WRITE_SCHEMES: Record<string, true> = {
   agent: true,
-  xd: true,
   out: true,
+};
+/** `xd://` writes invoke host tools; they are not messages or file targets. */
+const HOST_TOOL_WRITE_SCHEMES: Record<string, true> = {
+  xd: true,
 };
 
 const STATIC_IDENTIFIER = /[A-Za-z_$][\w$]*/y;
@@ -782,6 +908,94 @@ function isToolWriteCallAt(text: string, index: number): boolean {
   );
 }
 
+/** Skip a quoted literal; returns the offset after its closing quote. */
+function skipQuotedLiteral(text: string, start: number): number | undefined {
+  const quote = text[start];
+  let cursor = start + 1;
+  while (cursor < text.length) {
+    const character = text[cursor];
+    if (character === "\\") {
+      cursor += 2;
+      continue;
+    }
+    if (character === quote) return cursor + 1;
+    if (character === "\n" || character === "\r") return undefined;
+    cursor++;
+  }
+  return undefined;
+}
+
+/** Skip a template literal, including nested `${...}` expressions. */
+function skipTemplateLiteral(text: string, start: number): number | undefined {
+  let cursor = start + 1;
+  while (cursor < text.length) {
+    const character = text[cursor];
+    if (character === "\\") {
+      cursor += 2;
+      continue;
+    }
+    if (character === "`") return cursor + 1;
+    if (character === "$" && text[cursor + 1] === "{") {
+      const expressionEnd = skipInitializerExpression(text, cursor + 2);
+      if (expressionEnd === undefined || text[expressionEnd] !== "}") return undefined;
+      cursor = expressionEnd + 1;
+      continue;
+    }
+    cursor++;
+  }
+  return undefined;
+}
+
+/**
+ * Skip an arbitrary initializer expression until its top-level `,` or `}`.
+ * Only the object's structure matters here; the value itself (for example
+ * `JSON.stringify({...})`) is irrelevant to the static write target.
+ * Bracket pairs and string/template literals must balance.  A top-level `/`
+ * is rejected because regex literals can contain `,`/`}` and would otherwise
+ * let a value smuggle extra object properties past this parser.
+ */
+function skipInitializerExpression(text: string, start: number): number | undefined {
+  const stack: Array<"(" | "[" | "{"> = [];
+  let cursor = start;
+  while (cursor < text.length) {
+    const character = text[cursor];
+    if (character === "'" || character === "\"") {
+      const end = skipQuotedLiteral(text, cursor);
+      if (end === undefined) return undefined;
+      cursor = end;
+      continue;
+    }
+    if (character === "`") {
+      const end = skipTemplateLiteral(text, cursor);
+      if (end === undefined) return undefined;
+      cursor = end;
+      continue;
+    }
+    if (character === "/") return undefined;
+    if (character === "(" || character === "[" || character === "{") {
+      stack.push(character);
+      cursor++;
+      continue;
+    }
+    if (character === ")" || character === "]" || character === "}") {
+      if (stack.length === 0) return character === "}" ? cursor : undefined;
+      const open = stack.pop();
+      if (
+        (character === ")" && open !== "(") ||
+        (character === "]" && open !== "[") ||
+        (character === "}" && open !== "{")
+      ) {
+        return undefined;
+      }
+      cursor++;
+      continue;
+    }
+    if (character === "," && stack.length === 0) return cursor;
+    cursor++;
+  }
+  return undefined;
+}
+
 /** Read a static path from the supported `tool.write` object shape. */
 function readToolWriteObjectPath(
   view: StaticStringView,
@@ -791,11 +1005,23 @@ function readToolWriteObjectPath(
   if (view.text[cursor] !== "{") return undefined;
   cursor = skipStaticWhitespace(view.text, cursor + 1);
 
+  const finishObject = (
+    close: number,
+    target: StaticStringResolution | undefined,
+  ): StaticStringResolution | undefined => {
+    if (!target) return undefined;
+    // Require the call to end immediately after the object.  This keeps an
+    // ambiguous value from closing the object early and hiding later
+    // properties (for example a second `path`).
+    const next = skipStaticWhitespace(view.text, close + 1);
+    return view.text[next] === ")" ? target : undefined;
+  };
+
   let pathTarget: StaticStringResolution | undefined;
   let contentSeen = false;
   while (cursor < view.text.length) {
     cursor = skipStaticWhitespace(view.text, cursor);
-    if (view.text[cursor] === "}") return pathTarget;
+    if (view.text[cursor] === "}") return finishObject(cursor, pathTarget);
 
     const identifier = readStaticIdentifier(view.text, cursor);
     const literal = identifier ? undefined : readStaticString(view.text, cursor);
@@ -817,10 +1043,9 @@ function readToolWriteObjectPath(
       if (contentSeen) return undefined;
       contentSeen = true;
       const contentStart = skipStaticWhitespace(view.text, valueStart);
-      const content = readStaticString(view.text, contentStart) ??
-        readStaticIdentifier(view.text, contentStart);
-      if (!content) return undefined;
-      cursor = content.end;
+      const contentEnd = skipInitializerExpression(view.text, contentStart);
+      if (contentEnd === undefined) return undefined;
+      cursor = contentEnd;
     }
 
     cursor = skipStaticWhitespace(view.text, cursor);
@@ -828,13 +1053,13 @@ function readToolWriteObjectPath(
       cursor++;
       continue;
     }
-    if (view.text[cursor] === "}") return pathTarget;
+    if (view.text[cursor] === "}") return finishObject(cursor, pathTarget);
     return undefined;
   }
   return undefined;
 }
 
-/** Static file-write targets from Eval helpers, Python magics, and common file APIs. */
+/** Static file-write and host-tool targets from Eval helpers, Python magics, and common file APIs. */
 export function extractEvalWriteTargets(code: string, language?: string): EvalWriteTargets {
   const source = String(code ?? "");
   const executable = scrub(source, false);
@@ -844,6 +1069,7 @@ export function extractEvalWriteTargets(code: string, language?: string): EvalWr
     : undefined;
   const view: StaticStringView = { text: withStrings, code: executable };
   const paths = new Set<string>();
+  const hostToolTargets = new Set<string>();
   const cwdOperations: Array<{ offset: number; target: string }> = [];
   let cwdDynamic = false;
   let dynamic = false;
@@ -872,7 +1098,8 @@ export function extractEvalWriteTargets(code: string, language?: string): EvalWr
         }
         const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(target.value)?.[1]?.toLowerCase();
         if (scheme) {
-          if (NON_FILE_TOOL_WRITE_SCHEMES[scheme] !== true) dynamic = true;
+          if (HOST_TOOL_WRITE_SCHEMES[scheme] === true) hostToolTargets.add(target.value);
+          else if (NON_FILE_TOOL_WRITE_SCHEMES[scheme] !== true) dynamic = true;
           continue;
         }
         paths.add(target.value);
@@ -916,6 +1143,7 @@ export function extractEvalWriteTargets(code: string, language?: string): EvalWr
     dynamic,
     cwdPaths: cwdOperations.map((operation) => operation.target),
     cwdDynamic,
+    ...(hostToolTargets.size > 0 ? { hostToolTargets: [...hostToolTargets] } : {}),
   };
 }
 
