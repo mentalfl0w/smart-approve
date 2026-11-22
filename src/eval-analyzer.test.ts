@@ -822,6 +822,7 @@ test("requires confirmation for dynamic host-tool and namespace dispatch", () =>
     const r = analyzer.analyze(code, language, undefined, undefined, MCP_NAMESPACE_CONTEXT);
     assert.ok(r.behaviors.includes(DYNAMIC_HOST), code);
     assert.equal(r.requiresConfirmation, true, code);
+    assert.equal(r.memoryEligible, false, code);
     assert.equal(r.hardBlocked, false, code);
   }
 });

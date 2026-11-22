@@ -50,7 +50,8 @@ export class EvalToolGate extends ToolGate {
   protected readonly toolLabel = "Eval";
   protected readonly toolDescription =
     "Execute one Python or JavaScript cell in a persistent language runtime. " +
-    "Known high-risk launches and system-sensitive writes are hard-blocked; subprocesses, protected-path writes, and MCP/host-tool calls require review. " +
+    "Known high-risk launches and system-sensitive writes are hard-blocked; subprocesses, protected-path writes, and MCP/host-tool calls visible in the submitted cell require review. " +
+    "Calls hidden in helpers defined by earlier cells are outside this review. " +
     `Capability marker: ${TASK_GROUP_PROC_CANCEL_MARKER}`;
   protected readonly rememberScope = "session" as const;
   protected get strict(): boolean | undefined { return true; }
@@ -147,6 +148,15 @@ export class EvalToolGate extends ToolGate {
     let hardBlockedBySystemWrite = false;
     let requiresConfirmation = analysis.requiresConfirmation ?? false;
     let denyTier = analysis.denyTier;
+    // Operations whose actual target depends on runtime cwd state, or whose
+    // write target cannot be resolved statically, cannot be represented by a
+    // stable remembered decision: the same cell text can write elsewhere after
+    // a retained variable is rebound in another cell.
+    let memoryEligible = analysis.memoryEligible !== false &&
+      !unresolvedCwd &&
+      !writeTargets.cwdDynamic &&
+      !dynamicWrite &&
+      !unresolvedCwdOperation;
 
     if (sensitiveCwd) behaviors.add("eval-sensitive-working-directory");
     // `xd://` writes are host-tool invocations, not filesystem writes; keep
@@ -230,7 +240,15 @@ export class EvalToolGate extends ToolGate {
     if (hardBlockedBySystemWrite) {
       labels.push(makeLabel("Eval writes a system-sensitive file", "Eval 代码写入系统敏感文件"));
     }
-    return { ...analysis, behaviors: nextBehaviors, labels, hardBlocked, denyTier, requiresConfirmation };
+    return {
+      ...analysis,
+      behaviors: nextBehaviors,
+      labels,
+      hardBlocked,
+      denyTier,
+      requiresConfirmation,
+      memoryEligible,
+    };
   }
 
   protected buildKey(subject: string): string {

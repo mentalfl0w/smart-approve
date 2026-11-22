@@ -28,7 +28,7 @@ import { ModeManager, type CoverageSummary } from "./mode-manager";
 import { BashToolGate, UNRESOLVED_CWD, collectCdTargets, isUnresolvedCwd } from "./bash-tool";
 import { EvalToolGate } from "./eval-tool";
 import { extractEvalWriteTargets } from "./eval-analyzer";
-import { confirmWithRemember } from "./dialog";
+import { ApprovalFlow } from "./approval";
 import {
   applyProcServiceMode,
   forgetProcService,
@@ -88,6 +88,51 @@ function isHardBlockedFileTarget(target: string, cwd: string): boolean {
   );
 }
 
+const MAX_REVIEW_CHANGE_CHARS = 4000;
+
+/** Pull the requested content/patch/edits for the model prompt, clipped. */
+function readRequestedChange(event: ToolCallEvent): string | undefined {
+  const candidates = [
+    event.input.content,
+    event.input.input,
+    event.input._input,
+    event.input.edits,
+    event.input.ops,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+    if (candidate === undefined) continue;
+    try {
+      const serialized = JSON.stringify(candidate);
+      if (serialized && serialized !== "{}" && serialized !== "[]") return serialized;
+    } catch {
+      // Non-serializable input; the target list still identifies the review.
+    }
+  }
+  return undefined;
+}
+
+/** Review evidence for a protected-path write: tool, targets, requested change. */
+function formatProtectedReviewSubject(
+  event: ToolCallEvent,
+  targets: string[],
+  t: { tool: string; targets: string; requestedChange: string },
+): string {
+  const lines = [
+    `${t.tool}: ${event.toolName}`,
+    `${t.targets}:`,
+    ...targets.map((target) => `- ${target}`),
+  ];
+  const change = readRequestedChange(event);
+  if (change) {
+    const clipped = change.length > MAX_REVIEW_CHANGE_CHARS
+      ? `${change.slice(0, MAX_REVIEW_CHANGE_CHARS)}\n... (truncated)`
+      : change;
+    lines.push("", `${t.requestedChange}:`, clipped);
+  }
+  return lines.join("\n");
+}
+
 /** Apply ordered literal chdir targets to a tracked service cwd. */
 function applyCwdTargets(
   currentCwd: string,
@@ -140,6 +185,7 @@ class SmartApprove {
   private readonly contextGatherer: SessionContextGatherer;
   private readonly modelInvoker: ModelInvoker;
   private readonly policy: AutoDecisionPolicy;
+  private readonly approvalFlow: ApprovalFlow;
   private readonly coverage: CoverageSummary;
   private readonly modeManager: ModeManager;
   private bashGate: BashToolGate | undefined;
@@ -163,6 +209,16 @@ class SmartApprove {
       this.configStore.config.rpcIdleTimeoutMs,
     );
     this.policy = new AutoDecisionPolicy(this.configStore.config);
+    this.approvalFlow = new ApprovalFlow({
+      config: this.configStore.config,
+      allowList: this.allowList,
+      contextGatherer: this.contextGatherer,
+      modelInvoker: this.modelInvoker,
+      policy: this.policy,
+      logger: this.logger,
+      lang: this.lang,
+      t: this.t,
+    });
     this.coverage = { bash: false, eval: false, procInput: "false", protectedPaths: false };
     this.modeManager = new ModeManager(this.configStore, this.logger, this.coverage);
   }
@@ -279,6 +335,12 @@ class SmartApprove {
     this.pi.on("session_start", async (_event, ctx: ExtensionCtx) => {
       this.initializeHostTools(ctx);
       ctx.ui.setStatus("smart-approve-mode", this.configStore.config.mode);
+      // The unified flow no longer auto-allows operations without a model
+      // verdict.  Tell users who explicitly configured the deprecated key
+      // instead of silently changing its effect.
+      if (this.configStore.wasConfigured("autoFallback")) {
+        ctx.ui.notify?.(this.t.autoFallbackDeprecated, "warning");
+      }
     });
 
     this.pi.registerCommand("smart-approve", {
@@ -386,7 +448,10 @@ class SmartApprove {
         "System-sensitive file or device writes are hard-blocked",
         "系统敏感文件或设备写入已拦截",
       );
-      return { block: true, reason: `${label[this.lang]}: ${hardBlockedPaths.join("\n")}` };
+      return {
+        block: true,
+        reason: `Blocked: ${label[this.lang]}\n${this.t.decisionSourceHardBlock}\n${this.t.filePath}: ${hardBlockedPaths.join("\n")}`,
+      };
     }
     const protectedPaths = targets.filter((target) => this.pathMatcher.isProtected(target, cwd));
     if (protectedPaths.length === 0) return;
@@ -396,21 +461,44 @@ class SmartApprove {
       : protectedPaths;
     if (needsReview.length === 0) return;
 
-    const targetLabel = needsReview.join("\n");
     const t = this.t;
-    if (!ctx.hasUI) return { block: true, reason: t.blockedPathNoUI(targetLabel) };
-
-    const titleTarget = needsReview.length === 1 ? needsReview[0] : `${needsReview.length} sensitive files`;
-    const title = t.confirmPathTitle(titleTarget);
-    const body = `${t.filePath}: ${targetLabel}\n\n${t.allowPrompt}`;
-    const decision = await confirmWithRemember(ctx, title, body, t, config.rememberDecisions);
-    if (!decision.ok) return { block: true, reason: t.userDenied(targetLabel) };
-
-    if (decision.remember === "session") {
-      for (const target of needsReview) this.allowList.rememberSession(event.toolName, target, cwd);
-    } else if (decision.remember === "permanent") {
-      for (const target of needsReview) this.allowList.rememberPermanent(event.toolName, target, cwd);
-    }
+    const targetLabel = needsReview.join("\n");
+    const title = t.confirmPathTitle(
+      needsReview.length === 1 ? needsReview[0] : t.fileCount(needsReview.length),
+    );
+    const outcome = await this.approvalFlow.decide(
+      {
+        toolName: event.toolName,
+        label: t.protectedPathLabel,
+        subjectLabel: t.filePath,
+        promptSubject: formatProtectedReviewSubject(event, needsReview, t),
+        promptSubjectLabel: t.filePath,
+        displaySubject: targetLabel,
+        behaviorLabels: [t.protectedPathBehavior],
+        // Targets were already filtered through the allow-list above; the
+        // flow must review exactly `needsReview`, and remember each target.
+        memoryKey: null,
+        cwd,
+        rememberScope: "both",
+        title,
+        remember: (choice) => {
+          for (const target of needsReview) {
+            if (choice === "session") {
+              this.allowList.rememberSession(event.toolName, target, cwd);
+            } else {
+              this.allowList.rememberPermanent(event.toolName, target, cwd);
+            }
+          }
+        },
+      },
+      ctx,
+      ctx.signal,
+    );
+    if (outcome.allowed) return;
+    return {
+      block: true,
+      reason: outcome.result.content[0]?.text || t.userDenied(targetLabel),
+    };
   }
 }
 

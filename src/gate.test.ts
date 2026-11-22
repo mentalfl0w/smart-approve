@@ -42,6 +42,8 @@ interface Calls {
   notify: string[];
   session: string[];
   permanent: string[];
+  confirmBodies: string[];
+  selectBodies: string[];
 }
 
 interface Harness {
@@ -58,6 +60,7 @@ interface HarnessOptions {
   hasUI?: boolean;
   isAllowed?: boolean;
   analyzeResult?: RiskAnalysis | null;
+  analyzeThrows?: boolean;
   hostTools?: readonly HostToolInfo[];
 }
 
@@ -66,16 +69,29 @@ function makeHarness(
   opts: HarnessOptions = {},
 ): Harness {
   const config = makeConfig(configOverrides);
-  const calls: Calls = { delegate: 0, analyze: 0, notify: [], session: [], permanent: [] };
+  const calls: Calls = {
+    delegate: 0,
+    analyze: 0,
+    notify: [],
+    session: [],
+    permanent: [],
+    confirmBodies: [],
+    selectBodies: [],
+  };
+  const remembered = new Set<string>();
+  const keyOf = (tool: string, key: string, cwd: string): string => `${tool}:${key}:${cwd}`;
   const harness: Harness = {
     deps: {
       config,
       allowList: {
-        isAllowed: () => opts.isAllowed ?? false,
+        isAllowed: (tool: string, key: string, cwd: string) =>
+          opts.isAllowed === true || remembered.has(keyOf(tool, key, cwd)),
         rememberSession: (tool: string, key: string, cwd: string) => {
+          remembered.add(keyOf(tool, key, cwd));
           calls.session.push(`${tool}:${key}:${cwd}`);
         },
         rememberPermanent: (tool: string, key: string, cwd: string) => {
+          remembered.add(keyOf(tool, key, cwd));
           calls.permanent.push(`${tool}:${key}:${cwd}`);
         },
       },
@@ -86,6 +102,7 @@ function makeHarness(
       modelInvoker: {
         analyze: async (): Promise<RiskAnalysis | null> => {
           calls.analyze += 1;
+          if (opts.analyzeThrows) throw new Error("model unavailable");
           return opts.analyzeResult === undefined
             ? { risk: "low", recommend: "allow" }
             : opts.analyzeResult;
@@ -104,10 +121,14 @@ function makeHarness(
       hasUI: opts.hasUI ?? true,
       cwd: "/work/project",
       ui: {
-        confirm: async () => harness.confirmResult,
+        confirm: async (title: string, body: string) => {
+          calls.confirmBodies.push(title + "\n\n" + body);
+          return harness.confirmResult;
+        },
         select: async (title: string, choices: string[]) => {
           harness.selectChoices = [choices];
           harness.selectTitle = title;
+          calls.selectBodies.push(title);
           return harness.selectResult;
         },
         setStatus: () => undefined,
@@ -278,26 +299,38 @@ test("bash: symlinked cwd aliases are canonicalized before sensitivity analysis"
   }
 });
 
-test("bash: unresolved dynamic cwd requires confirmation and headless denies it", async () => {
+test("bash: unresolved dynamic cwd is model-reviewed but never remembered", async () => {
   const command = 'cd "$WORKING_DIR" && echo safe';
   const interactive = makeHarness();
   const confirmed = await run(BashToolGate, interactive, { command });
-  assert.equal(confirmed.isError, true);
-  assert.match(confirmed.content[0].text, /cannot be resolved without running the shell/);
-  assert.equal(interactive.calls.analyze, 0);
-  assert.equal(interactive.calls.delegate, 0);
+  // Success delegates and returns the native result, whose isError is optional.
+  assert.notEqual(confirmed.isError, true, confirmed.content[0].text);
+  assert.equal(interactive.calls.analyze, 1);
+  assert.equal(interactive.calls.delegate, 1);
+  // Unresolved cwd is not a stable memory key: no select, no remembered approval.
+  assert.equal(interactive.selectChoices, null);
+  assert.equal(interactive.calls.session.length, 0);
+  assert.match(interactive.calls.confirmBodies[0], /cannot be resolved without running the shell/);
+  assert.match(interactive.calls.confirmBodies[0], /Decision source: model analysis/);
+
+  const deniedHarness = makeHarness();
+  deniedHarness.confirmResult = false;
+  const denied = await run(BashToolGate, deniedHarness, { command });
+  assert.equal(denied.isError, true);
+  assert.equal(deniedHarness.calls.delegate, 0);
 
   // Remembered approvals must not turn an unresolved cwd into a safe path.
   const headless = makeHarness({}, { hasUI: false, isAllowed: true });
   const blocked = await run(BashToolGate, headless, { command });
   assert.equal(blocked.isError, true);
   assert.deepEqual(blocked.details, { blocked: true, reason: "no-ui" });
+  assert.equal(headless.calls.analyze, 0);
   assert.equal(headless.calls.delegate, 0);
 
   const dynamicParam = makeHarness({}, { hasUI: false });
-  const denied = await run(BashToolGate, dynamicParam, { command: "ls", cwd: "$WORKING_DIR" });
-  assert.equal(denied.isError, true);
-  assert.deepEqual(denied.details, { blocked: true, reason: "no-ui" });
+  const deniedParam = await run(BashToolGate, dynamicParam, { command: "ls", cwd: "$WORKING_DIR" });
+  assert.equal(deniedParam.isError, true);
+  assert.deepEqual(deniedParam.details, { blocked: true, reason: "no-ui" });
   assert.equal(dynamicParam.calls.delegate, 0);
 });
 
@@ -366,33 +399,100 @@ test("bash: auto mode AI block returns auto-blocked", async () => {
   assert.match(h.calls.notify[0], /Auto-blocked/);
 });
 
-test("bash: auto fallback regex blocks deny-tier protected force-push", async () => {
+test("bash: auto mode without a verdict asks the user instead of auto-allowing", async () => {
   const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
-  const r = await run(BashToolGate, h, { command: "git push --force origin main" });
+  const r = await run(BashToolGate, h, { command: "git push -f origin feature" });
   assert.equal(r.isError, true);
-  assert.deepEqual(r.details, { blocked: true, reason: "auto" });
+  assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 0);
+  assert.match(h.calls.selectBodies[0], /no usable model verdict/);
+  assert.match(h.calls.selectBodies[0], /Decision source: no usable model verdict/);
 });
 
-test("bash: auto fallback regex allows review-tier when AI absent", async () => {
+test("bash: auto mode without a verdict can still be approved by the user", async () => {
   const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  h.selectResult = "Allow for this session";
   const r = await run(BashToolGate, h, { command: "git push -f origin feature" });
   assert.equal(r.content[0].text, "native-run");
   assert.equal(h.calls.delegate, 1);
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.session.length, 1);
+  assert.equal(h.calls.notify.length, 0);
 });
 
-test("bash: auto fallback block blocks review-tier when AI absent", async () => {
+test("bash: auto fallback block no longer overrides manual confirmation", async () => {
   const h = makeHarness({ mode: "auto", autoFallback: "block" }, { analyzeResult: null });
+  h.selectResult = "Allow for this session";
+  const r = await run(BashToolGate, h, { command: "git push -f origin feature" });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+});
+
+test("bash: auto mode + no UI + autoInHeadless=false blocks before analysis", async () => {
+  const h = makeHarness({ mode: "auto" }, { hasUI: false });
   const r = await run(BashToolGate, h, { command: "git push -f origin feature" });
   assert.equal(r.isError, true);
-  assert.deepEqual(r.details, { blocked: true, reason: "auto" });
+  assert.deepEqual(r.details, { blocked: true, reason: "no-ui" });
+  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.calls.delegate, 0);
 });
 
-test("bash: git force push to main is deny-tier", async () => {
-  const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
-  const r = await run(BashToolGate, h, { command: "git push --force origin main" });
+test("bash: auto mode + no UI + autoInHeadless=true uses a valid verdict", async () => {
+  const allowed = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const allowedResult = await run(BashToolGate, allowed, { command: "git push -f origin feature" });
+  assert.equal(allowedResult.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+
+  const blocked = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: { risk: "high", recommend: "allow" } },
+  );
+  const blockedResult = await run(BashToolGate, blocked, { command: "git push -f origin feature" });
+  assert.equal(blockedResult.isError, true);
+  assert.deepEqual(blockedResult.details, { blocked: true, reason: "auto" });
+  assert.equal(blocked.calls.analyze, 1);
+});
+
+test("bash: auto mode + no UI + no verdict blocks even with autoInHeadless", async () => {
+  const h = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const r = await run(BashToolGate, h, { command: "git push -f origin feature" });
   assert.equal(r.isError, true);
-  assert.deepEqual(r.details, { blocked: true, reason: "auto" });
+  assert.deepEqual(r.details, { blocked: true, reason: "no-verdict" });
+  assert.match(r.content[0].text, /no usable model verdict/i);
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 0);
+});
+
+test("bash: analysis failure is a no-verdict, never an auto-allow", async () => {
+  const h = makeHarness({ mode: "auto" }, { analyzeThrows: true });
+  const r = await run(BashToolGate, h, { command: "git push -f origin feature" });
+  assert.equal(r.isError, true);
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 0);
+  assert.match(h.calls.selectBodies[0], /no usable model verdict/);
+});
+
+test("bash: auto mode with llmAnalysis disabled asks the user", async () => {
+  const h = makeHarness({ mode: "auto", llmAnalysis: false });
+  h.selectResult = "Allow for this session";
+  const r = await run(BashToolGate, h, { command: "git push -f origin feature" });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.calls.delegate, 1);
+  assert.match(h.calls.selectBodies[0], /model analysis is disabled/);
+});
+
+test("bash: deny-tier labels do not replace a valid model verdict", async () => {
+  const h = makeHarness({ mode: "auto" });
+  const r = await run(BashToolGate, h, { command: "git push --force origin main" });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
 });
 
 test("bash: branch deletes need review, including plain -d", async () => {
@@ -464,6 +564,26 @@ test("bash: abort after analysis returns aborted, no dialog", async () => {
   assert.equal(h.selectChoices, null);
 });
 
+test("bash: abort while the dialog is open neither executes nor remembers", async () => {
+  for (const choice of ["Allow for this session", "Always allow"]) {
+    const h = makeHarness();
+    const controller = new AbortController();
+    // The host cancels the call while the prompt is pending; the dialog still
+    // resolves with an allow because cancellation and clicking race.
+    h.ctx.ui.select = async () => {
+      controller.abort();
+      return choice;
+    };
+    const r = await run(BashToolGate, h, { command: "git push -f" }, controller.signal);
+    assert.equal(r.content[0].text, "(aborted)", choice);
+    assert.deepEqual(r.details, { aborted: true }, choice);
+    assert.equal(h.calls.analyze, 1, choice);
+    assert.equal(h.calls.delegate, 0, choice);
+    assert.equal(h.calls.session.length, 0, choice);
+    assert.equal(h.calls.permanent.length, 0, choice);
+  }
+});
+
 // ── EvalToolGate ─────────────────────────────────────────────────────
 
 test("eval: safe code delegates directly", async () => {
@@ -494,31 +614,46 @@ test("eval: exact Task Group pool-cancel write delegates without review", async 
   assert.equal(h.calls.delegate, 1);
 });
 
-test("eval: Task Group-looking extra properties still require confirmation", async () => {
-  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
-  const r = await run(EvalToolGate, h, {
-    language: "js",
-    code: `
+test("eval: Task Group-looking extra properties go through the model", async () => {
+  const code = `
 const TG_GROUP = "tgabc";
 const TG_PROTOCOL = "omp-task-group/eval-result-v1";
 await tool.write({ path: "proc://" + TG_GROUP + "/kill", content: "extra" });
-`,
-  });
-  assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "no-ui");
-  assert.equal(h.calls.analyze, 0);
-  assert.equal(h.calls.delegate, 0);
+`;
+  const allowed = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
+  assert.equal(allowedResult.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+
+  const noVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.delegate, 0);
 });
 
-test("eval: object write to a protected path still requires confirmation", async () => {
-  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
-  const r = await run(EvalToolGate, h, {
-    language: "js",
-    code: 'await tool.write({ path: ".env" })',
-  });
-  assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "no-ui");
-  assert.equal(h.calls.delegate, 0);
+test("eval: object write to a protected path goes through the model", async () => {
+  const code = 'await tool.write({ path: ".env" })';
+  const allowed = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
+  assert.equal(allowedResult.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+
+  const noVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.delegate, 0);
 });
 
 test("eval: auto mode delegates object tool.write virtual targets without a confirmation dialog", async () => {
@@ -578,13 +713,16 @@ test("eval: direct MCP calls are reviewed by the model in auto mode", async () =
 });
 
 test("eval: direct MCP calls cannot be auto-allowed without a model verdict", async () => {
-  const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const h = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
   const r = await run(EvalToolGate, h, {
     language: "py",
     code: "await tool.mcp__ssh_manager_ssh_execute({'server':'x','command':'id'})",
   });
   assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "auto");
+  assert.equal(reasonOf(r), "no-verdict");
   assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 0);
 });
@@ -609,26 +747,51 @@ test("eval: MCP namespace calls use the live host tool inventory", async () => {
   assert.equal(h.calls.delegate, 1);
 });
 
-test("eval: dynamic host-tool dispatch requires confirmation, not model review", async () => {
-  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
-  const r = await run(EvalToolGate, h, {
-    language: "js",
-    code: "await tool[name]({})",
-  });
-  assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "no-ui");
-  assert.equal(h.calls.analyze, 0);
-  assert.equal(h.calls.delegate, 0);
+test("eval: dynamic host-tool dispatch goes through the model", async () => {
+  const code = "await tool[name]({})";
+  const allowed = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
+  assert.equal(allowedResult.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+
+  const noVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.delegate, 0);
+});
+
+test("eval: dynamic host-tool dispatch ignores remembered decisions and offers no memory", async () => {
+  // `name` is retained across cells, so the same source text can dispatch a
+  // different host tool.  A remembered approval must not cover that.
+  const h = makeHarness({}, { isAllowed: true });
+  const r = await run(EvalToolGate, h, { language: "js", code: "await tool[name]({})" });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+  // Not keyed for memory: a plain confirm, never a remember select.
+  assert.equal(h.selectChoices, null);
+  assert.equal(h.calls.confirmBodies.length, 1);
+  assert.equal(h.calls.session.length, 0);
+  assert.equal(h.calls.permanent.length, 0);
 });
 
 test("eval: xd host-tool writes cannot be auto-allowed without a model verdict", async () => {
-  const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const h = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: "await tool.write({path:'xd://mcp__x',content:'{}'})",
   });
   assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "auto");
+  assert.equal(reasonOf(r), "no-verdict");
   assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 0);
 });
@@ -646,56 +809,72 @@ test("eval: template-interpolated content cannot hide a system write", async () 
 });
 
 test("eval: template-interpolated content cannot hide a protected write", async () => {
-  const h = makeHarness({ mode: "auto" });
-  h.selectResult = "Allow for this session";
-  const r = await run(EvalToolGate, h, {
-    language: "js",
-    code: "const hidden = `${write('.env', secret)}`;\n" +
-      "await tool.write({path:'notes.md',content:hidden})",
-  });
-  assert.equal(r.content[0].text, "native-run");
-  assert.equal(h.calls.delegate, 1);
-  assert.equal(h.calls.analyze, 0);
-  assert.equal(h.selectChoices?.[0].length, 2);
+  const code = "const hidden = `${write('.env', secret)}`;\n" +
+    "await tool.write({path:'notes.md',content:hidden})";
 
-  const noUI = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const auto = makeHarness({ mode: "auto" });
+  const automatic = await run(EvalToolGate, auto, { language: "js", code });
+  assert.equal(automatic.content[0].text, "native-run");
+  assert.equal(auto.calls.delegate, 1);
+  assert.equal(auto.calls.analyze, 1);
+  assert.equal(auto.selectChoices, null);
+
+  const interactive = makeHarness();
+  interactive.selectResult = "Allow for this session";
+  const reviewed = await run(EvalToolGate, interactive, { language: "js", code });
+  assert.equal(reviewed.content[0].text, "native-run");
+  assert.equal(interactive.calls.analyze, 1);
+  assert.equal(interactive.selectChoices?.[0].length, 2);
+  assert.match(interactive.calls.selectBodies[0], /Writes a protected file/);
+
+  const noUI = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
   const blocked = await run(EvalToolGate, noUI, {
     language: "js",
     code: "await tool.write({path:'notes.md',content:`${write(target, secret)}`})",
   });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.equal(noUI.calls.analyze, 1);
   assert.equal(noUI.calls.delegate, 0);
 });
 
 test("eval: object tool.write file targets still apply protected-path checks", async () => {
+  const code = 'await tool.write({ "path": ".env", "content": "secret" })';
   const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
-  const r = await run(EvalToolGate, h, {
-    language: "js",
-    code: 'await tool.write({ "path": ".env", "content": "secret" })',
-  });
-  assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "no-ui");
-  assert.match(r.content[0].text, /protected file/i);
-  assert.equal(h.calls.delegate, 0);
+  const r = await run(EvalToolGate, h, { language: "js", code });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+
+  const noVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.match(blocked.content[0].text, /protected file/i);
+  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.delegate, 0);
 });
 
-test("eval: direct protected write helper requires confirmation even in auto mode", async () => {
+test("eval: direct protected write helper is auto-decided by a valid model verdict", async () => {
   const h = makeHarness({ mode: "auto" });
-  h.selectResult = "Allow for this session";
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'await write(".env", "secret")',
   });
   assert.equal(r.content[0].text, "native-run");
-  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 1);
-  assert.equal(h.selectChoices?.[0].length, 2);
+  assert.equal(h.selectChoices, null);
 });
 
-test("eval protected writes bypass remembered approvals and require user confirmation", async () => {
+test("eval protected writes honor a remembered approval", async () => {
   const h = makeHarness({ mode: "auto" }, { isAllowed: true });
-  h.selectResult = "Allow for this session";
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'await write(".env", "secret")',
@@ -703,19 +882,64 @@ test("eval protected writes bypass remembered approvals and require user confirm
   assert.equal(r.content[0].text, "native-run");
   assert.equal(h.calls.analyze, 0);
   assert.equal(h.calls.delegate, 1);
-  assert.equal(h.selectChoices?.[0].length, 2);
+  assert.equal(h.selectChoices, null);
 });
 
-test("eval computed file-write targets require confirmation in auto mode", async () => {
+test("eval computed file-write targets go through the model in auto mode", async () => {
+  const code = "await Bun.write(target, content)";
   const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const r = await run(EvalToolGate, h, { language: "js", code });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+
+  const noVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.delegate, 0);
+});
+
+test("eval: dynamic write targets ignore remembered decisions and offer no memory", async () => {
+  // `target` is retained across cells, so the same source text can write to a
+  // different path.  A remembered approval of the code shape must not cover it.
+  const h = makeHarness({}, { isAllowed: true });
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: "await Bun.write(target, content)",
   });
-  assert.equal(r.isError, true);
-  assert.equal((r.details as { reason: string }).reason, "no-ui");
-  assert.equal(h.calls.analyze, 0);
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+  assert.equal(h.selectChoices, null);
+  assert.equal(h.calls.confirmBodies.length, 1);
+  assert.equal(h.calls.session.length, 0);
+  assert.equal(h.calls.permanent.length, 0);
+});
+
+test("eval: abort while the confirm dialog is open neither executes nor remembers", async () => {
+  const h = makeHarness({}, { isAllowed: true });
+  const controller = new AbortController();
+  h.ctx.ui.confirm = async () => {
+    controller.abort();
+    return true;
+  };
+  const r = await run(
+    EvalToolGate,
+    h,
+    { language: "js", code: "await Bun.write(target, content)" },
+    controller.signal,
+  );
+  assert.equal(r.content[0].text, "(aborted)");
+  assert.deepEqual(r.details, { aborted: true });
+  assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 0);
+  assert.equal(h.calls.session.length, 0);
+  assert.equal(h.calls.permanent.length, 0);
 });
 
 test("eval hard-blocks sensitive system-file writes without subprocess intent", async () => {
@@ -771,15 +995,26 @@ test("eval hard-blocks relative writes after changing into a sensitive directory
   assert.equal(h.calls.delegate, 0);
 });
 
-test("eval requires confirmation for relative writes after a dynamic directory change", async () => {
-  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
-  const r = await run(EvalToolGate, h, {
-    language: "js",
-    code: "process.chdir(target); await write('output.txt', content)",
-  });
-  assert.equal(r.isError, true);
-  assert.equal((r.details as { reason: string }).reason, "no-ui");
-  assert.equal(h.calls.delegate, 0);
+test("eval: relative writes after a dynamic directory change go through the model", async () => {
+  const code = "process.chdir(target); await write('output.txt', content)";
+  const interactive = makeHarness();
+  const allowed = await run(EvalToolGate, interactive, { language: "js", code });
+  assert.equal(allowed.content[0].text, "native-run");
+  assert.equal(interactive.calls.analyze, 1);
+  assert.equal(interactive.calls.delegate, 1);
+  // Runtime-dependent cwd: no memory option is offered.
+  assert.equal(interactive.selectChoices, null);
+  assert.equal(interactive.calls.session.length, 0);
+
+  const noVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.delegate, 0);
 });
 test("eval gates Python shell magics and writefile targets", async () => {
   const shell = makeHarness();
@@ -793,13 +1028,26 @@ test("eval gates Python shell magics and writefile targets", async () => {
   assert.equal(shell.calls.delegate, 0);
 
   const protectedWrite = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
-  const blockedWrite = await run(EvalToolGate, protectedWrite, {
+  const allowedWrite = await run(EvalToolGate, protectedWrite, {
+    language: "py",
+    code: "%%writefile .env\nsecret",
+  });
+  assert.equal(allowedWrite.content[0].text, "native-run");
+  assert.equal(protectedWrite.calls.analyze, 1);
+  assert.equal(protectedWrite.calls.delegate, 1);
+
+  const noVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blockedWrite = await run(EvalToolGate, noVerdict, {
     language: "py",
     code: "%%writefile .env\nsecret",
   });
   assert.equal(blockedWrite.isError, true);
-  assert.equal((blockedWrite.details as { reason: string }).reason, "no-ui");
-  assert.equal(protectedWrite.calls.delegate, 0);
+  assert.equal(reasonOf(blockedWrite), "no-verdict");
+  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.delegate, 0);
 
   const systemWrite = makeHarness();
   const blockedSystemWrite = await run(EvalToolGate, systemWrite, {
@@ -820,35 +1068,55 @@ test("eval gates Python shell magics and writefile targets", async () => {
   assert.equal(sensitiveCwd.calls.delegate, 0);
 });
 
-test("eval external Python source and unresolved proc cwd require confirmation", async () => {
+test("eval external Python source and unresolved proc cwd go through the model", async () => {
   const externalSource = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
-  const blockedSource = await run(EvalToolGate, externalSource, {
+  const allowedSource = await run(EvalToolGate, externalSource, {
+    language: "py",
+    code: "%run script.py",
+  });
+  assert.equal(allowedSource.content[0].text, "native-run");
+  assert.equal(externalSource.calls.analyze, 1);
+  assert.equal(externalSource.calls.delegate, 1);
+
+  const sourceNoVerdict = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
+  const blockedSource = await run(EvalToolGate, sourceNoVerdict, {
     language: "py",
     code: "%run script.py",
   });
   assert.equal(blockedSource.isError, true);
-  assert.equal((blockedSource.details as { reason: string }).reason, "no-ui");
-  assert.equal(externalSource.calls.analyze, 0);
-  assert.equal(externalSource.calls.delegate, 0);
+  assert.equal(reasonOf(blockedSource), "no-verdict");
+  assert.equal(sourceNoVerdict.calls.analyze, 1);
+  assert.equal(sourceNoVerdict.calls.delegate, 0);
 
-  const unknownCwdWrite = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const unknownCwdWrite = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
   const blockedWrite = await run(EvalToolGate, unknownCwdWrite, {
     language: "py",
     code: "open('credentials', 'w')",
     cwd: UNRESOLVED_CWD,
   });
   assert.equal(blockedWrite.isError, true);
-  assert.equal((blockedWrite.details as { reason: string }).reason, "no-ui");
+  assert.equal(reasonOf(blockedWrite), "no-verdict");
+  assert.equal(unknownCwdWrite.calls.analyze, 1);
   assert.equal(unknownCwdWrite.calls.delegate, 0);
 
-  const unknownCwdSpawn = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const unknownCwdSpawn = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, analyzeResult: null },
+  );
   const blockedSpawn = await run(EvalToolGate, unknownCwdSpawn, {
     language: "js",
     code: "Bun.spawn(['ls'])",
     cwd: UNRESOLVED_CWD,
   });
   assert.equal(blockedSpawn.isError, true);
-  assert.equal((blockedSpawn.details as { reason: string }).reason, "no-ui");
+  assert.equal(reasonOf(blockedSpawn), "no-verdict");
+  assert.equal(unknownCwdSpawn.calls.analyze, 1);
   assert.equal(unknownCwdSpawn.calls.delegate, 0);
 });
 

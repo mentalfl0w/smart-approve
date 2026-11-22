@@ -461,6 +461,7 @@ export class BashToolGate extends ToolGate {
     let hardBlocked = analysis.hardBlocked;
     let denyTier = analysis.denyTier;
     let requiresConfirmation = analysis.requiresConfirmation ?? false;
+    let memoryEligible = analysis.memoryEligible !== false;
     const behaviors = [...analysis.behaviors];
     const labels = [...analysis.labels];
     const merge = (extra: DangerAnalysis): void => {
@@ -475,6 +476,7 @@ export class BashToolGate extends ToolGate {
       if (extra.hardBlocked) hardBlocked = true;
       if (extra.denyTier) denyTier = true;
       if (extra.requiresConfirmation) requiresConfirmation = true;
+      if (extra.memoryEligible === false) memoryEligible = false;
     };
 
     const scanned = collectCdTargets(subject);
@@ -513,6 +515,10 @@ export class BashToolGate extends ToolGate {
     if (chainUnknown) {
       requiresConfirmation = true;
       denyTier = true;
+      // The same command text can resolve to different paths when the
+      // runtime working directory changes; a remembered decision would be
+      // stale, so this operation is not memory-eligible.
+      memoryEligible = false;
       if (!behaviors.includes("bash-unresolved-working-directory")) {
         behaviors.push("bash-unresolved-working-directory");
       }
@@ -525,7 +531,15 @@ export class BashToolGate extends ToolGate {
       }
     }
 
-    return { ...analysis, behaviors, labels, hardBlocked, denyTier, requiresConfirmation };
+    return {
+      ...analysis,
+      behaviors,
+      labels,
+      hardBlocked,
+      denyTier,
+      requiresConfirmation,
+      memoryEligible,
+    };
   }
 
   protected buildKey(subject: string): string {

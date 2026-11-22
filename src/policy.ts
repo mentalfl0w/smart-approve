@@ -2,10 +2,12 @@
  * Smart Approve — auto-mode decision policy.
  *
  * Turns a parsed LLM risk analysis into a verdict when mode is "auto".
- * When the LLM chain fails entirely (or the analysis is unreadable), the
- * verdict comes from the configured fallback: hard block, or the regex
- * deny tier.  Kept as a pure class so the matrix is unit-testable without
- * spawning omp.
+ * The policy has no fallback verdict: when the model produced no usable
+ * answer, `decide()` returns null and the approval flow asks the user
+ * (interactive UI) or blocks (no UI).  Hard blocks still win before the
+ * policy runs and are never overridable.
+ *
+ * Kept as a pure class so the matrix is unit-testable without spawning omp.
  */
 
 import type { RiskAnalysis } from "./types";
@@ -15,7 +17,7 @@ import type { SmartApproveConfig } from "./config";
 export interface PolicyDecision {
   verdict: "allow" | "block";
   /** Stable machine id for logging; not user-facing. */
-  reason: "ai-risk" | "ai-recommend" | "fallback-block" | "fallback-deny-tier" | "fallback-regex";
+  reason: "ai-risk" | "ai-recommend";
 }
 
 function normalizeRisk(raw: string | undefined): "low" | "medium" | "high" | null {
@@ -41,14 +43,13 @@ function normalizeRecommend(raw: string | undefined): "allow" | "deny" | null {
  *    blocks when autoBlockRisk is "medium")
  *  - risk = high but recommend = allow -> block (contradiction resolves to
  *    the stricter signal; the command text is untrusted input)
- *  - no usable verdict       -> fallback: autoFallback "block", else the
- *    deny tier (regex-confident behaviors), else allow.
+ *  - no usable verdict       -> null (the flow asks the user or blocks)
  */
 export class AutoDecisionPolicy {
   constructor(private readonly config: SmartApproveConfig) {}
 
-  /** Decide from an LLM analysis plus the regex deny-tier signal. */
-  decide(analysis: RiskAnalysis | null, denyTierHit: boolean): PolicyDecision {
+  /** Decide from a model analysis.  null means "no usable verdict". */
+  decide(analysis: RiskAnalysis | null): PolicyDecision | null {
     const recommend = normalizeRecommend(analysis?.recommend);
     const risk = normalizeRisk(analysis?.risk);
 
@@ -60,17 +61,9 @@ export class AutoDecisionPolicy {
     }
 
     // Any parseable verdict (recommend=allow, or risk=low/medium below the
-    // threshold) permits execution.  No verdict at all -> fallback.
+    // threshold) permits execution.  Not enough information -> no verdict.
     if (recommend === "allow" || risk !== null) return { verdict: "allow", reason: "ai-risk" };
 
-    return this.fallback(denyTierHit);
-  }
-
-  private fallback(denyTierHit: boolean): PolicyDecision {
-    if (this.config.autoFallback === "block") {
-      return { verdict: "block", reason: "fallback-block" };
-    }
-    if (denyTierHit) return { verdict: "block", reason: "fallback-deny-tier" };
-    return { verdict: "allow", reason: "fallback-regex" };
+    return null;
   }
 }

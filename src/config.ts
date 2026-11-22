@@ -22,9 +22,16 @@ export interface SmartApproveConfig {
   mode: ApprovalMode;
   /** Auto mode: AI verdict at or above this risk level blocks. */
   autoBlockRisk: AutoBlockRisk;
-  /** Auto mode: what to do when the LLM chain fails entirely. */
+  /** Auto mode: legacy compatibility key for LLM-chain failure behavior.
+   *  The unified approval flow no longer auto-allows operations without a
+   *  usable verdict: a UI session asks the user, and a headless session
+   *  blocks.  This key is still parsed and written back untouched so
+   *  existing user configs keep loading, but it does not affect decisions.
+   *  See `autoInHeadless` for the no-UI model gate. */
   autoFallback: AutoFallback;
-  /** Auto mode: subagent sessions (no UI) also use AI decisions. */
+  /** Auto mode: subagent sessions (no UI) also use model verdicts.  Valid
+   *  verdicts are auto-decided only when this is true; no-verdict operations
+   *  still block without a UI. */
   autoInHeadless: boolean;
   /** Per-tool coverage toggles. */
   coverage: { eval: boolean };
@@ -125,6 +132,9 @@ export class ConfigStore {
   readonly configPath: string;
   readonly allowListPath: string;
   private readonly dirty = new Set<keyof SmartApproveConfig>();
+  /** Top-level keys present in the user's config file.  Runtime defaults and
+   *  values written by persist() do not count. */
+  private readonly configuredKeys = new Set<string>();
 
   constructor(private readonly logger?: LoggerLike, configDir?: string) {
     const dir = configDir ?? getConfigDir();
@@ -133,11 +143,22 @@ export class ConfigStore {
     this.config = this.load();
   }
 
+  /** True when the user explicitly wrote this key in smart-approve.json. */
+  wasConfigured(key: keyof SmartApproveConfig): boolean {
+    return this.configuredKeys.has(key);
+  }
+
   private load(): SmartApproveConfig {
     try {
       if (fs.existsSync(this.configPath)) {
         const raw = fs.readFileSync(this.configPath, "utf-8");
-        const merged = mergeConfig(JSON.parse(raw));
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          for (const key of Object.keys(parsed as Record<string, unknown>)) {
+            this.configuredKeys.add(key);
+          }
+        }
+        const merged = mergeConfig(parsed);
         this.logger?.log(`config loaded: ${this.configPath}`);
         return merged;
       }

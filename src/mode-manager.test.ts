@@ -74,7 +74,10 @@ test("status reports enabled protection surfaces without legacy Hub coverage", (
   const { manager } = makeManager(dir, { bash: true, eval: false, procInput: "false", protectedPaths: true });
   const status = manager.status();
   assert.match(status, /mode: interactive/);
-  assert.match(status, /coverage: bash=true eval=false proc-input=false protected-paths=true/);
+  assert.match(status, /coverage: bash=true eval=false proc-input=false protected-paths=direct-tools/);
+  assert.match(status, /eval-scope: current cell only/);
+  assert.match(status, /autoFallback: regex \(legacy key/);
+  assert.match(status, /autoInHeadless: false \(valid model verdicts only/);
   assert.doesNotMatch(status, /hub=/i);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -84,6 +87,25 @@ test("status distinguishes shell-only proc input when Eval coverage is disabled"
   const { manager } = makeManager(dir, { bash: true, eval: false, procInput: "shell-only", protectedPaths: true });
   assert.match(manager.status(), /proc-input=shell-only/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("wasConfigured tracks only keys present in the user's config file", () => {
+  const configuredDir = tempDir();
+  fs.writeFileSync(
+    path.join(configuredDir, "smart-approve.json"),
+    JSON.stringify({ autoFallback: "regex", mode: "auto" }),
+    "utf-8",
+  );
+  const configured = new ConfigStore(silentLogger, configuredDir);
+  assert.equal(configured.wasConfigured("autoFallback"), true);
+  assert.equal(configured.wasConfigured("mode"), true);
+  assert.equal(configured.wasConfigured("autoInHeadless"), false);
+  fs.rmSync(configuredDir, { recursive: true, force: true });
+
+  const defaultDir = tempDir();
+  const defaults = new ConfigStore(silentLogger, defaultDir);
+  assert.equal(defaults.wasConfigured("autoFallback"), false);
+  fs.rmSync(defaultDir, { recursive: true, force: true });
 });
 
 test("legacy coverage.hub config is ignored without breaking configuration", () => {

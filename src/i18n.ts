@@ -17,15 +17,30 @@ export interface I18nLang {
   command: string;
   code: string;
   filePath: string;
+  tool: string;
+  targets: string;
+  requestedChange: string;
+  fileCount: (count: number) => string;
   allowPrompt: string;
   analysisUnavailable: string;
+  analysisDisabled: string;
   blockedNoUI: (label: string) => string;
-  blockedPathNoUI: (p: string) => string;
+  blockedNoVerdictNoUI: (label: string) => string;
   userDenied: (label: string) => string;
-  autoBlocked: (label: string) => string;
-  autoAllowed: (label: string) => string;
+  autoAllowedByModel: (label: string, detail: string) => string;
+  autoBlockedByModel: (label: string, detail: string) => string;
+  decisionSourceModel: (detail: string) => string;
+  decisionSourceNoVerdict: string;
+  decisionSourceNoVerdictNoUI: string;
+  decisionSourceAnalysisDisabled: string;
+  decisionSourceNoUI: string;
+  decisionSourceAutoHeadless: string;
+  decisionSourceHardBlock: string;
+  protectedPathLabel: string;
+  protectedPathBehavior: string;
   modeSwitched: (mode: string) => string;
   cmdHelp: string;
+  autoFallbackDeprecated: string;
   promptIntro: string;
   promptContext: string;
   promptRule: string;
@@ -48,9 +63,7 @@ export interface I18nLang {
   };
   sessionAllow: string;
   permanentAllow: string;
-  rememberQuestion: string;
-  configLoaded: (p: string) => string;
-  configError: (p: string) => string;
+  deny: string;
 }
 
 export type I18n = I18nLang;
@@ -58,9 +71,9 @@ export type Lang = "zh" | "en";
 
 const I18N: Record<Lang, I18nLang> = {
   zh: {
-    analyzing: "⚡ 正在用模型分析命令风险…",
-    confirmTitle: (label) => `⚠️ 高危命令确认: ${label}`,
-    confirmPathTitle: (p) => `⚠️ 敏感路径保护: ${p}`,
+    analyzing: "正在用模型分析风险…",
+    confirmTitle: (label) => `高危操作确认: ${label}`,
+    confirmPathTitle: (p) => `敏感路径保护: ${p}`,
     risk: "风险等级",
     summary: "摘要",
     detail: "详情",
@@ -68,15 +81,30 @@ const I18N: Record<Lang, I18nLang> = {
     command: "命令",
     code: "代码",
     filePath: "文件",
+    tool: "工具",
+    targets: "目标",
+    requestedChange: "请求的修改",
+    fileCount: (count) => `${count} 个文件`,
     allowPrompt: "是否允许执行？",
     analysisUnavailable: "（模型分析不可用）",
-    blockedNoUI: (label) => `[smart-approve] 高危命令被拦截（无 UI 无法确认）: ${label}`,
-    blockedPathNoUI: (p) => `[smart-approve] 敏感路径写入被拦截（无 UI 无法确认）: ${p}`,
+    analysisDisabled: "（模型分析已关闭）",
+    blockedNoUI: (label) => `[smart-approve] 需要审查，但当前没有可确认的界面: ${label}`,
+    blockedNoVerdictNoUI: (label) => `[smart-approve] 拦截：模型没有给出有效判断，且当前没有可确认的界面: ${label}`,
     userDenied: (label) => `[smart-approve] 用户拒绝: ${label}`,
-    autoBlocked: (label) => `[smart-approve] 已自动拦截: ${label}`,
-    autoAllowed: (label) => `[smart-approve] 已自动放行: ${label}`,
-    modeSwitched: (mode) => `[smart-approve] 已切换到 ${mode === "auto" ? "auto 模式（AI 自动裁决，不再弹窗）" : "interactive 模式（危险操作弹窗确认）"}`,
+    autoAllowedByModel: (label, detail) => `[smart-approve] 模型自动放行（${detail}）: ${label}`,
+    autoBlockedByModel: (label, detail) => `[smart-approve] 模型自动拦截（${detail}）: ${label}`,
+    decisionSourceModel: (detail) => `决定来源: 模型分析（${detail}）`,
+    decisionSourceNoVerdict: "决定来源: 模型没有给出有效判断，需要人工确认",
+    decisionSourceNoVerdictNoUI: "决定来源: autoInHeadless 允许采用模型判断，但模型没有给出有效判断；无界面时按策略阻断",
+    decisionSourceAnalysisDisabled: "决定来源: 模型分析已关闭，需要人工确认",
+    decisionSourceNoUI: "决定来源: 当前没有可确认的界面，按策略阻断",
+    decisionSourceAutoHeadless: "决定来源: autoInHeadless=false，无界面时不采用模型自动裁决",
+    decisionSourceHardBlock: "决定来源: 硬禁止规则（不可绕过）",
+    protectedPathLabel: "受保护文件写入",
+    protectedPathBehavior: "请求写入受保护路径",
+    modeSwitched: (mode) => `[smart-approve] 已切换到 ${mode === "auto" ? "auto 模式（模型有效判断按风险阈值自动裁决；无有效判断时人工确认）" : "interactive 模式（危险操作弹窗确认）"}`,
     cmdHelp: "用法: /smart-approve auto | interactive | status（无参数时切换模式）",
+    autoFallbackDeprecated: "[smart-approve] 配置项 autoFallback 已弃用：模型没有有效判断时，有界面会要求人工确认，无界面则阻断。该键仍会保留但不再影响裁决，可从 smart-approve.json 移除。",
     promptIntro: "你是 shell 命令风险分析器。分析下面这条命令，给出风险评估。",
     promptContext: "会话上下文",
     promptRule: "检测到的行为",
@@ -99,14 +127,12 @@ const I18N: Record<Lang, I18nLang> = {
     },
     sessionAllow: "本次会话允许",
     permanentAllow: "永久允许",
-    rememberQuestion: "记住此决策？",
-    configLoaded: (p) => `[smart-approve] 配置已加载: ${p}`,
-    configError: (p) => `[smart-approve] 配置加载失败，使用默认: ${p}`,
+    deny: "拒绝",
   },
   en: {
-    analyzing: "⚡ Analyzing command risk with model…",
-    confirmTitle: (label) => `⚠️ Dangerous command: ${label}`,
-    confirmPathTitle: (p) => `⚠️ Protected path: ${p}`,
+    analyzing: "Analyzing risk with model…",
+    confirmTitle: (label) => `High-risk operation: ${label}`,
+    confirmPathTitle: (p) => `Protected path: ${p}`,
     risk: "Risk",
     summary: "Summary",
     detail: "Detail",
@@ -114,15 +140,30 @@ const I18N: Record<Lang, I18nLang> = {
     command: "Command",
     code: "Code",
     filePath: "File",
+    tool: "Tool",
+    targets: "Targets",
+    requestedChange: "Requested change",
+    fileCount: (count) => `${count} files`,
     allowPrompt: "Allow execution?",
     analysisUnavailable: "(model analysis unavailable)",
-    blockedNoUI: (label) => `[smart-approve] Dangerous command blocked (no UI to confirm): ${label}`,
-    blockedPathNoUI: (p) => `[smart-approve] Protected path write blocked (no UI to confirm): ${p}`,
+    analysisDisabled: "(model analysis disabled)",
+    blockedNoUI: (label) => `[smart-approve] Review required, but no UI is available to confirm: ${label}`,
+    blockedNoVerdictNoUI: (label) => `[smart-approve] Blocked: no usable model verdict and no UI is available to confirm: ${label}`,
     userDenied: (label) => `[smart-approve] User denied: ${label}`,
-    autoBlocked: (label) => `[smart-approve] Auto-blocked: ${label}`,
-    autoAllowed: (label) => `[smart-approve] Auto-allowed: ${label}`,
-    modeSwitched: (mode) => `[smart-approve] Switched to ${mode === "auto" ? "auto mode (AI decides, no dialogs)" : "interactive mode (dialogs for dangerous ops)"}`,
+    autoAllowedByModel: (label, detail) => `[smart-approve] Auto-allowed by model (${detail}): ${label}`,
+    autoBlockedByModel: (label, detail) => `[smart-approve] Auto-blocked by model (${detail}): ${label}`,
+    decisionSourceModel: (detail) => `Decision source: model analysis (${detail})`,
+    decisionSourceNoVerdict: "Decision source: no usable model verdict; manual confirmation required",
+    decisionSourceNoVerdictNoUI: "Decision source: autoInHeadless permits model verdicts, but none was usable; blocked without a UI",
+    decisionSourceAnalysisDisabled: "Decision source: model analysis is disabled; manual confirmation required",
+    decisionSourceNoUI: "Decision source: no UI is available; blocked by policy",
+    decisionSourceAutoHeadless: "Decision source: autoInHeadless=false blocks model decisions without a UI",
+    decisionSourceHardBlock: "Decision source: hard block (cannot be overridden)",
+    protectedPathLabel: "Protected file write",
+    protectedPathBehavior: "Requests a write to a protected path",
+    modeSwitched: (mode) => `[smart-approve] Switched to ${mode === "auto" ? "auto mode (valid model verdicts decide by threshold; manual confirmation when no verdict is available)" : "interactive mode (dialogs for dangerous ops)"}`,
     cmdHelp: "Usage: /smart-approve auto | interactive | status (no args toggles the mode)",
+    autoFallbackDeprecated: "[smart-approve] autoFallback is deprecated: when the model has no usable verdict, a UI session asks you and a headless session blocks. The key is preserved in config but no longer affects decisions.",
     promptIntro: "You are a shell command risk analyzer. Analyze the following command and provide a risk assessment.",
     promptContext: "Session context",
     promptRule: "Detected behaviors",
@@ -145,9 +186,7 @@ const I18N: Record<Lang, I18nLang> = {
     },
     sessionAllow: "Allow for this session",
     permanentAllow: "Always allow",
-    rememberQuestion: "Remember this decision?",
-    configLoaded: (p) => `[smart-approve] Config loaded: ${p}`,
-    configError: (p) => `[smart-approve] Config load failed, using defaults: ${p}`,
+    deny: "Deny",
   },
 };
 
