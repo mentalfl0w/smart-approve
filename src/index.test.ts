@@ -381,7 +381,7 @@ test("OMP native wrappers preserve schemas, rewritten Eval input, proc guards, a
 
     const statusCommand = host.commands.get("smart-approve")!;
     await statusCommand.handler("status", ctx);
-    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=true proc-input=tracked protected-paths=true/);
+    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=true proc-input=tracked protected-paths=direct-tools\n/);
     assert.match(host.notices.at(-1) ?? "", /eval-scope: current cell only/);
     assert.doesNotMatch(host.notices.at(-1) ?? "", /hub=/i);
 
@@ -438,7 +438,7 @@ test("OMP reports shell-only proc input when Eval coverage is disabled", async (
     await host.initialize(ctx);
     assert.deepEqual(host.registered.map((tool) => tool.name), ["bash"]);
     await host.commands.get("smart-approve")!.handler("status", ctx);
-    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=false proc-input=shell-only protected-paths=true/);
+    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=false proc-input=shell-only protected-paths=direct-tools\n/);
   });
 });
 
@@ -453,7 +453,7 @@ test("OMP does not report tracked proc input without a stable session id", async
     const ctx = makeContext(host.delegated, host.notices, false, null);
     await host.initialize(ctx);
     await host.commands.get("smart-approve")!.handler("status", ctx);
-    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=true proc-input=false protected-paths=true/);
+    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=true proc-input=false protected-paths=direct-tools\n/);
   });
 });
 
@@ -467,7 +467,7 @@ test("OMP reports shell-only proc input when native wrappers are incomplete", as
     const ctx = makeContext(host.delegated, host.notices);
     await host.initialize(ctx);
     await host.commands.get("smart-approve")!.handler("status", ctx);
-    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=false proc-input=shell-only protected-paths=true/);
+    assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=false proc-input=shell-only protected-paths=direct-tools\n/);
   });
 });
 
