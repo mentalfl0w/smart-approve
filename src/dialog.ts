@@ -18,15 +18,16 @@ export function formatAnalysis(analysis: RiskAnalysis | null, t: I18n): string |
   if (analysis.recommend) lines.push(`${t.recommend}: ${analysis.recommend}`);
   return lines.length ? lines.join("\n") : null;
 }
+
 /**
  * Confirmation dialog with optional remember option.
  *
  * scope "both" (default): three choices — session allow, permanent allow,
- * deny.  scope "session": two choices — session allow, deny (used by tools
- * where permanent remember is meaningless, e.g. eval code).
+ * deny.  scope "session": two choices — session allow, deny (used where
+ * permanent remember cannot be honored, e.g. eval code).
  *
- * If rememberDecisions is disabled or the host lacks ui.select, falls back
- * to a simple confirm() (allow / deny).
+ * When `rememberDecisions` is false the dialog is a simple allow/deny
+ * confirm, so no memory option is shown that would not take effect.
  *
  * Returns: { ok, remember } where ok=false means the user denied.
  */
@@ -38,16 +39,14 @@ export async function confirmWithRemember(
   rememberDecisions: boolean,
   scope: "session" | "both" = "both",
 ): Promise<{ ok: boolean; remember: RememberChoice }> {
-  // If remember is disabled or UI doesn't support select, use simple confirm
   if (!rememberDecisions || typeof ctx.ui.select !== "function") {
     const ok = await ctx.ui.confirm(title, body);
     return { ok, remember: "none" };
   }
 
-  const denyLabel = "❌ " + (ctx.lang === "zh" ? "拒绝" : "Deny");
   const choices = scope === "both"
-    ? [t.sessionAllow, t.permanentAllow, denyLabel]
-    : [t.sessionAllow, denyLabel];
+    ? [t.sessionAllow, t.permanentAllow, t.deny]
+    : [t.sessionAllow, t.deny];
   const choice = await ctx.ui.select(title + "\n\n" + body, choices);
 
   // OMP resolves select() with the option label (string), not an index.
@@ -56,8 +55,6 @@ export async function confirmWithRemember(
   if (scope === "both" && (choice === t.permanentAllow || choice === 1)) {
     return { ok: true, remember: "permanent" };
   }
-  if (scope === "session" && choice === 1) return { ok: false, remember: "none" };
-  if (choice === denyLabel || choice === 2) return { ok: false, remember: "none" };
-  // Undefined / null / anything else → treat as deny (fail-closed).
+  // Undefined / null / deny label / anything else → deny (fail-closed).
   return { ok: false, remember: "none" };
 }

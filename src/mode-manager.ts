@@ -48,10 +48,11 @@ export class ModeManager {
     return [
       `mode: ${c.mode}`,
       `autoBlockRisk: ${c.autoBlockRisk}`,
-      `autoFallback: ${c.autoFallback}`,
-      `autoInHeadless: ${c.autoInHeadless}`,
+      `autoFallback: ${c.autoFallback} (legacy key; no-verdict operations ask with UI and block without UI)`,
+      `autoInHeadless: ${c.autoInHeadless} (valid model verdicts only; no verdict blocks without UI)`,
       `llmAnalysis: ${c.llmAnalysis}`,
-      `coverage: bash=${this.coverage.bash} eval=${this.coverage.eval} proc-input=${this.coverage.procInput} protected-paths=${this.coverage.protectedPaths}`,
+      `coverage: bash=${this.coverage.bash} eval=${this.coverage.eval} proc-input=${this.coverage.procInput} protected-paths=${this.coverage.protectedPaths ? "direct-tools" : "false"}`,
+      "eval-scope: current cell only; helpers or MCP calls created in earlier cells are not visible to static review",
     ].join("\n");
   }
 }

@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { AutoDecisionPolicy } from "./policy.ts";
+import type { PolicyDecision } from "./policy.ts";
+import type { RiskAnalysis } from "./types.ts";
 import type { SmartApproveConfig } from "./config.ts";
 
 function makeConfig(overrides: Partial<SmartApproveConfig> = {}): SmartApproveConfig {
@@ -22,65 +24,55 @@ function makeConfig(overrides: Partial<SmartApproveConfig> = {}): SmartApproveCo
   };
 }
 
+function decided(policy: AutoDecisionPolicy, analysis: RiskAnalysis | null): PolicyDecision {
+  const decision = policy.decide(analysis);
+  assert.ok(decision, "expected a usable verdict");
+  return decision;
+}
+
 test("recommend deny blocks regardless of risk", () => {
   const p = new AutoDecisionPolicy(makeConfig());
-  const d = p.decide({ risk: "low", recommend: "deny" }, false);
+  const d = decided(p, { risk: "low", recommend: "deny" });
   assert.equal(d.verdict, "block");
   assert.equal(d.reason, "ai-recommend");
 });
 
 test("risk high blocks even when recommend says allow (conflict resolves stricter)", () => {
   const p = new AutoDecisionPolicy(makeConfig());
-  assert.equal(p.decide({ risk: "high", recommend: "allow" }, false).verdict, "block");
-  assert.equal(p.decide({ risk: "high" }, false).verdict, "block");
+  assert.equal(decided(p, { risk: "high", recommend: "allow" }).verdict, "block");
+  assert.equal(decided(p, { risk: "high" }).verdict, "block");
 });
 
 test("risk medium blocks only when autoBlockRisk is medium", () => {
+  assert.equal(decided(new AutoDecisionPolicy(makeConfig()), { risk: "medium" }).verdict, "allow");
   assert.equal(
-    new AutoDecisionPolicy(makeConfig()).decide({ risk: "medium" }, false).verdict,
-    "allow",
-  );
-  assert.equal(
-    new AutoDecisionPolicy(makeConfig({ autoBlockRisk: "medium" }))
-      .decide({ risk: "medium" }, false).verdict,
+    decided(new AutoDecisionPolicy(makeConfig({ autoBlockRisk: "medium" })), {
+      risk: "medium",
+    }).verdict,
     "block",
   );
 });
 
 test("low risk or explicit allow passes", () => {
   const p = new AutoDecisionPolicy(makeConfig());
-  assert.equal(p.decide({ risk: "low" }, false).verdict, "allow");
-  assert.equal(p.decide({ risk: "low", recommend: "allow" }, false).verdict, "allow");
+  assert.equal(decided(p, { risk: "low" }).verdict, "allow");
+  assert.equal(decided(p, { risk: "low", recommend: "allow" }).verdict, "allow");
 });
 
 test("recommend values are normalized (yes/no variants)", () => {
   const p = new AutoDecisionPolicy(makeConfig());
-  assert.equal(p.decide({ recommend: "yes" }, false).verdict, "allow");
-  assert.equal(p.decide({ recommend: "NO" }, false).verdict, "block");
+  assert.equal(decided(p, { recommend: "yes" }).verdict, "allow");
+  assert.equal(decided(p, { recommend: "NO" }).verdict, "block");
 });
 
-test("no analysis: fallback regex allows without deny tier", () => {
-  const p = new AutoDecisionPolicy(makeConfig());
-  const d = p.decide(null, false);
-  assert.equal(d.verdict, "allow");
-  assert.equal(d.reason, "fallback-regex");
-});
+test("missing or unreadable analysis returns no verdict (no regex fallback)", () => {
+  const regexFallback = new AutoDecisionPolicy(makeConfig());
+  assert.equal(regexFallback.decide(null), null);
+  assert.equal(regexFallback.decide({ risk: "banana", recommend: "maybe" }), null);
+  assert.equal(regexFallback.decide({ summary: "text only" }), null);
 
-test("no analysis: fallback regex blocks deny-tier behavior", () => {
-  const p = new AutoDecisionPolicy(makeConfig());
-  const d = p.decide(null, true);
-  assert.equal(d.verdict, "block");
-  assert.equal(d.reason, "fallback-deny-tier");
-});
-
-test("no analysis: fallback block always blocks", () => {
-  const p = new AutoDecisionPolicy(makeConfig({ autoFallback: "block" }));
-  assert.equal(p.decide(null, false).verdict, "block");
-  assert.equal(p.decide(null, false).reason, "fallback-block");
-});
-
-test("unreadable analysis falls back (garbage fields)", () => {
-  const p = new AutoDecisionPolicy(makeConfig());
-  assert.equal(p.decide({ risk: "banana", recommend: "maybe" }, false).reason, "fallback-regex");
-  assert.equal(p.decide({ summary: "text only" }, true).reason, "fallback-deny-tier");
+  // The legacy autoFallback setting must not turn no-verdict into allow.
+  const blockFallback = new AutoDecisionPolicy(makeConfig({ autoFallback: "block" }));
+  assert.equal(blockFallback.decide(null), null);
+  assert.equal(blockFallback.decide({ summary: "text only" }), null);
 });

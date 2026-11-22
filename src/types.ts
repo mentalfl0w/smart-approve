@@ -210,13 +210,19 @@ export interface DangerAnalysis {
   behaviors: string[];
   /** Localized labels for display. */
   labels: { en: string; zh: string }[];
-  /** True if any matched behavior is in the deny tier (regex-confident,
-   *  blocks when auto mode has no LLM verdict and fallback is "regex"). */
+  /** True if any matched behavior is in the regex-confident deny tier.  This
+   *  is evidence for review, not an automatic verdict by itself. */
   denyTier: boolean;
   /** True if any matched behavior is in the hard-block set. */
   hardBlocked: boolean;
-  /** Requires a user confirmation even when auto mode has a model verdict. */
+  /** Statically identified as needing review even when no behavior label was
+   *  matched.  It no longer bypasses the model or the allow-list. */
   requiresConfirmation?: boolean;
+  /** False when this operation cannot be safely keyed for memorized
+   *  decisions because its target depends on runtime state (for example an
+   *  unresolved working directory).  The flow then offers no memory choice
+   *  and ignores existing entries for that operation. */
+  memoryEligible?: boolean;
 }
 
 /** A persisted or in-memory allow-list decision. */

@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import smartApprove from "./index.ts";
+import { detectLang, getI18n } from "./i18n.ts";
 import type { AgentToolResult, ExtensionAPI, ExtensionCtx, HostToolInfo, ToolDefinition } from "./types.ts";
 
 interface TestCallEvent {
@@ -381,6 +382,7 @@ test("OMP native wrappers preserve schemas, rewritten Eval input, proc guards, a
     const statusCommand = host.commands.get("smart-approve")!;
     await statusCommand.handler("status", ctx);
     assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=true proc-input=tracked protected-paths=true/);
+    assert.match(host.notices.at(-1) ?? "", /eval-scope: current cell only/);
     assert.doesNotMatch(host.notices.at(-1) ?? "", /hub=/i);
 
     // Session shutdown drops that session's tracked services; a later write
@@ -466,6 +468,144 @@ test("OMP reports shell-only proc input when native wrappers are incomplete", as
     await host.initialize(ctx);
     await host.commands.get("smart-approve")!.handler("status", ctx);
     assert.match(host.notices.at(-1) ?? "", /coverage: bash=true eval=false proc-input=shell-only protected-paths=true/);
+  });
+});
+
+test("protected path reviews honor a remembered session choice", async () => {
+  await withTemporaryHome(async (home) => {
+    fs.writeFileSync(
+      path.join(home, ".omp", "agent", "smart-approve.json"),
+      JSON.stringify({ llmAnalysis: false, rememberDecisions: true }),
+    );
+    const host = makeHost([
+      builtin("bash", { native: "bash" }),
+      builtin("eval", { native: "eval" }),
+      builtin("write", { native: "write" }),
+    ]);
+    smartApprove(host.api);
+    const ctx = makeContext(host.delegated, host.notices, true);
+    await host.initialize(ctx);
+    let selectCalls = 0;
+    const select = ctx.ui.select!;
+    ctx.ui.select = async (title: string, choices: string[]) => {
+      selectCalls += 1;
+      return select(title, choices);
+    };
+    const callHandler = host.handlers.get("tool_call")!.at(-1)!;
+
+    const first = await callHandler(
+      { toolName: "write", input: { path: ".env", content: "secret" } },
+      ctx,
+    );
+    assert.equal(first, undefined);
+    assert.equal(selectCalls, 1);
+
+    // The same tool + target is now remembered for the session.
+    const second = await callHandler(
+      { toolName: "write", input: { path: ".env", content: "another secret" } },
+      ctx,
+    );
+    assert.equal(second, undefined);
+    assert.equal(selectCalls, 1);
+  });
+});
+
+test("auto mode protected-path review asks with UI and blocks without UI", async () => {
+  await withTemporaryHome(async (home) => {
+    fs.writeFileSync(
+      path.join(home, ".omp", "agent", "smart-approve.json"),
+      JSON.stringify({ mode: "auto", autoInHeadless: false, llmAnalysis: false }),
+    );
+    const host = makeHost([
+      builtin("bash", { native: "bash" }),
+      builtin("eval", { native: "eval" }),
+      builtin("write", { native: "write" }),
+    ]);
+    smartApprove(host.api);
+    const uiCtx = makeContext(host.delegated, host.notices, true);
+    await host.initialize(uiCtx);
+    const callHandler = host.handlers.get("tool_call")!.at(-1)!;
+
+    // No model verdict + UI: the user decides (select returns the first choice).
+    const reviewed = await callHandler(
+      { toolName: "write", input: { path: ".env", content: "secret" } },
+      uiCtx,
+    );
+    assert.equal(reviewed, undefined);
+
+    // Use a different cwd so the UI session's remembered decision does not
+    // mask the headless no-UI policy in this shared allow-list instance.
+    const headlessCtx = makeContext(
+      host.delegated,
+      host.notices,
+      false,
+      "headless-session",
+      "/work/other",
+    );
+    const blocked = await callHandler(
+      { toolName: "write", input: { path: ".env", content: "secret" } },
+      headlessCtx,
+    );
+    if (!isBlocked(blocked)) assert.fail("expected headless protected-path write to be blocked");
+    assert.match(blocked.reason, /no UI|需要审查/);
+  });
+});
+
+test("auto mode protected-path review blocks headless when no verdict exists", async () => {
+  await withTemporaryHome(async (home) => {
+    fs.writeFileSync(
+      path.join(home, ".omp", "agent", "smart-approve.json"),
+      JSON.stringify({ mode: "auto", autoInHeadless: true, llmAnalysis: false }),
+    );
+    const host = makeHost([
+      builtin("bash", { native: "bash" }),
+      builtin("eval", { native: "eval" }),
+      builtin("write", { native: "write" }),
+    ]);
+    smartApprove(host.api);
+    const ctx = makeContext(host.delegated, host.notices, false);
+    await host.initialize(ctx);
+    const callHandler = host.handlers.get("tool_call")!.at(-1)!;
+
+    const blocked = await callHandler(
+      { toolName: "write", input: { path: ".env", content: "secret" } },
+      ctx,
+    );
+    if (!isBlocked(blocked)) assert.fail("expected headless protected-path write to be blocked");
+    assert.match(blocked.reason, /no usable model verdict|没有给出有效判断/i);
+  });
+});
+
+test("explicit autoFallback config shows a migration warning", async () => {
+  await withTemporaryHome(async (home) => {
+    fs.writeFileSync(
+      path.join(home, ".omp", "agent", "smart-approve.json"),
+      JSON.stringify({ autoFallback: "regex" }),
+    );
+    const host = makeHost([
+      builtin("bash", { native: "bash" }),
+      builtin("eval", { native: "eval" }),
+      builtin("write", { native: "write" }),
+    ]);
+    smartApprove(host.api);
+    const ctx = makeContext(host.delegated, host.notices);
+    await host.initialize(ctx);
+    const warning = getI18n(detectLang()).autoFallbackDeprecated;
+    assert.ok(host.notices.includes(warning), host.notices.join("\n"));
+  });
+});
+
+test("default config does not show the autoFallback migration warning", async () => {
+  await withTemporaryHome(async () => {
+    const host = makeHost([
+      builtin("bash", { native: "bash" }),
+      builtin("eval", { native: "eval" }),
+      builtin("write", { native: "write" }),
+    ]);
+    smartApprove(host.api);
+    const ctx = makeContext(host.delegated, host.notices);
+    await host.initialize(ctx);
+    assert.ok(!host.notices.some((notice) => notice.includes("autoFallback")), host.notices.join("\n"));
   });
 });
 

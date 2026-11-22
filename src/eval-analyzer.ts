@@ -1690,6 +1690,16 @@ export class EvalCodeBehaviorAnalyzer {
       // When no model verdict is available, auto mode must not infer safety.
       denyTier: found.has("eval-mcp-tool-invocation"),
     };
-    return requiresConfirmation ? { ...analysis, requiresConfirmation: true } : analysis;
+    // `%run` reads a file whose contents can change, an unresolved shell cwd
+    // can make the same source target different paths, and a dynamic host-tool
+    // dispatch resolves its target at runtime.  None of them can be safely
+    // represented by a remembered decision on the source text.
+    const memoryEligible = !shellUnresolvedCwd &&
+      pythonScan?.externalSource !== true &&
+      !found.has("eval-dynamic-host-tool-invocation");
+    const result = requiresConfirmation
+      ? { ...analysis, requiresConfirmation: true }
+      : analysis;
+    return memoryEligible ? result : { ...result, memoryEligible: false };
   }
 }

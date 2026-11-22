@@ -3,11 +3,10 @@
  *
  * ToolGate owns the decision pipeline that was previously bash-only:
  *
- *   hard-block -> allowlist -> no-behavior -> headless check
- *   -> LLM analysis -> verdict (auto policy or interactive dialog)
+ *   hard-block -> safe pass-through -> allow-list/model/user decision
  *   -> remember -> delegate
  *
- * Concrete gates (bash, eval) supply the three tool-specific hooks:
+ * Concrete gates (bash, eval) supply the tool-specific hooks:
  * analyze() / buildKey() / delegate(), plus the schema and subject
  * extraction.  The flow itself never varies, so every covered tool gets
  * identical approval semantics.
@@ -18,53 +17,20 @@ import type {
   ExtensionCtx,
   AgentToolResult,
   DangerAnalysis,
-  RiskAnalysis,
   ZodLike,
   HostToolInfo,
 } from "./types";
-import type { SmartApproveConfig } from "./config";
-import type { AutoDecisionPolicy } from "./policy";
-import type { LoggerLike } from "./logger";
-import type { I18n, Lang } from "./i18n";
-import { confirmWithRemember, formatAnalysis } from "./dialog";
+import type { ApprovalDeps } from "./approval";
+import { ApprovalFlow } from "./approval";
 
-/** Narrow collaborator contracts (dependency inversion): concrete classes
- *  satisfy these structurally; tests can supply stubs. */
-export interface AllowListLike {
-  isAllowed(tool: string, content: string, cwd: string): boolean;
-  rememberSession(tool: string, content: string, cwd: string): void;
-  rememberPermanent(tool: string, content: string, cwd: string): void;
-}
-
-export interface ContextGathererLike {
-  gather(ctx: ExtensionCtx, maxChars: number): unknown;
-  format(sessionCtx: unknown, t: I18n): string;
-}
-
-export interface ModelInvokerLike {
-  analyze(
-    subject: string,
-    subjectLabel: string,
-    behaviorLabels: string[],
-    contextSection: string,
-    t: I18n,
-    model: string,
-    signal?: AbortSignal,
-    ctx?: ExtensionCtx,
-  ): Promise<RiskAnalysis | null>;
-}
-
+export type {
+  AllowListLike,
+  ContextGathererLike,
+  ModelInvokerLike,
+} from "./approval";
 
 /** Shared collaborators injected into every gate instance. */
-export interface GateDeps {
-  config: SmartApproveConfig;
-  allowList: AllowListLike;
-  contextGatherer: ContextGathererLike;
-  modelInvoker: ModelInvokerLike;
-  policy: AutoDecisionPolicy;
-  logger: LoggerLike;
-  lang: Lang;
-  t: I18n;
+export interface GateDeps extends ApprovalDeps {
   protectedPathMatcher?: { isProtected(filePath: string, baseCwd?: string): boolean };
   /** Live host tool inventory.  Eval uses it to recognize nested MCP calls
    *  and MCP namespace globals; read lazily because MCP tools connect after
@@ -81,9 +47,13 @@ export type ToolUpdateCallback =
   ((update: { content: unknown[]; details?: unknown }) => void) | undefined;
 
 export abstract class ToolGate {
+  private readonly approval: ApprovalFlow;
+
   // Public so concrete gates can be constructed by the orchestrator and
   // tests; the class is abstract, so it cannot be instantiated directly.
-  constructor(protected readonly deps: GateDeps) {}
+  constructor(protected readonly deps: GateDeps) {
+    this.approval = new ApprovalFlow(deps);
+  }
 
   // ── Tool identity (per concrete gate) ──────────────────────────────
 
@@ -154,154 +124,58 @@ export abstract class ToolGate {
     signal: AbortSignal | undefined,
     ctx: ExtensionCtx,
   ): Promise<GateAuthorization> {
-    const { config, allowList, contextGatherer, modelInvoker, policy, logger, lang, t } = this.deps;
+    const { logger, lang, t } = this.deps;
     const subject = this.extractSubject(params);
     if (!subject.trim()) return { allowed: true };
 
     const effectiveCwd = this.resolveCwd(params, ctx);
-    const hasUI = ctx.hasUI;
-    logger.log(`${this.toolName}: subject="${subject.slice(0, 80)}" cwd=${effectiveCwd} hasUI=${hasUI}`);
+    logger.log(`${this.toolName}: subject="${subject.slice(0, 80)}" cwd=${effectiveCwd} hasUI=${ctx.hasUI}`);
 
     const analysis = this.analyze(subject, params, ctx);
     const label = analysis.labels[0]?.[lang] || analysis.labels[0]?.en || "danger";
     const subjectLabel = this.subjectDisplayLabel();
 
-    // Hard-block always wins over the allowlist.
+    // Hard blocks precede every collaborator: no allow-list entry, model
+    // verdict, mode, or memory choice can override them.
     if (analysis.hardBlocked) {
       logger.log(`${this.toolName}: hard-blocked (${label})`);
       return {
         allowed: false,
-        result: this.textError(
-          `Blocked: ${label}\n${subjectLabel}: ${subject}`,
-          { blocked: true, reason: label },
-        ),
+        result: {
+          content: [{
+            type: "text",
+            text: `Blocked: ${label}\n${t.decisionSourceHardBlock}\n${subjectLabel}: ${subject}`,
+          }],
+          details: { blocked: true, reason: label },
+          isError: true,
+        },
       };
     }
 
-    if (
-      !analysis.requiresConfirmation &&
-      config.rememberDecisions &&
-      allowList.isAllowed(this.toolName, this.buildKey(subject), effectiveCwd)
-    ) {
-      return { allowed: true };
-    }
-
+    // Safe operations stay zero-interruption: no model call, no dialog.
     if (analysis.behaviors.length === 0 && !analysis.requiresConfirmation) {
       return { allowed: true };
     }
 
-    const autoMode = config.mode === "auto";
-    if (analysis.requiresConfirmation && !hasUI) {
-      logger.log(`${this.toolName}: protected operation blocked (no UI) — ${label}`);
-      return {
-        allowed: false,
-        result: this.textError(
-          `${t.blockedNoUI(label)}\n${subjectLabel}: ${subject}`,
-          { blocked: true, reason: "no-ui" },
-        ),
-      };
-    }
-    if (!hasUI && !(autoMode && config.autoInHeadless)) {
-      logger.log(`${this.toolName}: blocked (no UI) — ${label}`);
-      return {
-        allowed: false,
-        result: this.textError(
-          `${t.blockedNoUI(label)}\n${subjectLabel}: ${subject}`,
-          { blocked: true, reason: "no-ui" },
-        ),
-      };
-    }
-
-    let aiResult: RiskAnalysis | null = null;
-    let analysisText: string | null = null;
-    if (config.llmAnalysis && !analysis.requiresConfirmation) {
-      ctx.ui.setStatus("smart-approve", t.analyzing);
-      try {
-        const sessionCtx = contextGatherer.gather(ctx, config.contextMaxChars);
-        const contextSection = contextGatherer.format(sessionCtx, t);
-        const behaviorLabels = analysis.labels.map((item) => item[lang] || item.en);
-        logger.log(
-          `${this.toolName}: analyzeRisk subject="${subject.slice(0, 80)}" behaviors=[${behaviorLabels.join(",")}]`,
-        );
-        aiResult = await modelInvoker.analyze(
-          subject,
-          this.promptSubjectLabel(),
-          behaviorLabels,
-          contextSection,
-          t,
-          config.model,
-          signal,
-          ctx,
-        );
-        analysisText = formatAnalysis(aiResult, t);
-        logger.log(`${this.toolName}: analysisText=${analysisText ? "OK" : "null"}`);
-      } catch (e) {
-        logger.log(`${this.toolName}: LLM analysis failed: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        ctx.ui.setStatus("smart-approve", undefined);
-      }
-    }
-
-    if (signal?.aborted) {
-      logger.log(`${this.toolName}: aborted during analysis`);
-      return {
-        allowed: false,
-        result: { content: [{ type: "text", text: "(aborted)" }], details: { aborted: true } },
-      };
-    }
-
-    if (autoMode && !analysis.requiresConfirmation) {
-      const decision = policy.decide(aiResult, analysis.denyTier);
-      logger.log(`${this.toolName}: auto decision=${decision.verdict} reason=${decision.reason} (${label})`);
-      if (decision.verdict === "allow") {
-        ctx.ui.notify?.(t.autoAllowed(label), "info");
-        return { allowed: true };
-      }
-      ctx.ui.notify?.(t.autoBlocked(label), "warning");
-      return {
-        allowed: false,
-        result: this.textError(
-          `${t.autoBlocked(label)}\n${subjectLabel}: ${subject}`,
-          { blocked: true, reason: "auto" },
-        ),
-      };
-    }
-
-    const title = t.confirmTitle(label);
-    const body = analysis.requiresConfirmation
-      ? `${subjectLabel}: ${subject}\n\n${t.allowPrompt}`
-      : analysisText
-        ? `${analysisText}\n\n────────\n${subjectLabel}: ${subject}\n\n${t.allowPrompt}`
-        : `${t.analysisUnavailable}\n\n${subjectLabel}: ${subject}\n\n${t.allowPrompt}`;
-    const decision = await confirmWithRemember(
+    const memoryEligible = analysis.memoryEligible !== false;
+    const outcome = await this.approval.decide(
+      {
+        toolName: this.toolName,
+        label,
+        subjectLabel,
+        promptSubject: subject,
+        promptSubjectLabel: this.promptSubjectLabel(),
+        displaySubject: subject,
+        behaviorLabels: analysis.labels.map((item) => item[lang] || item.en),
+        memoryKey: memoryEligible ? this.buildKey(subject) : null,
+        cwd: effectiveCwd,
+        rememberScope: this.rememberScope,
+      },
       ctx,
-      title,
-      body,
-      t,
-      config.rememberDecisions,
-      this.rememberScope,
+      signal,
     );
-    if (!decision.ok) {
-      logger.log(`${this.toolName}: user denied — ${label}`);
-      return {
-        allowed: false,
-        result: this.textError(t.userDenied(label), { denied: true, reason: label }),
-      };
-    }
-
-    if (decision.remember === "session") {
-      allowList.rememberSession(this.toolName, this.buildKey(subject), effectiveCwd);
-    } else if (decision.remember === "permanent") {
-      allowList.rememberPermanent(this.toolName, this.buildKey(subject), effectiveCwd);
-    }
-    if (signal?.aborted) {
-      logger.log(`${this.toolName}: aborted after approval, not executing`);
-      return {
-        allowed: false,
-        result: { content: [{ type: "text", text: "(aborted)" }], details: { aborted: true } },
-      };
-    }
-    return { allowed: true };
+    if (outcome.allowed) return { allowed: true };
+    return { allowed: false, result: outcome.result };
   }
 
   async execute(
@@ -318,9 +192,5 @@ export abstract class ToolGate {
     }
     this.deps.logger.log(`${this.toolName}: approved, delegating to native`);
     return this.delegate(params, signal, onUpdate, ctx);
-  }
-
-  private textError(text: string, details: Record<string, unknown>): AgentToolResult {
-    return { content: [{ type: "text", text }], details, isError: true };
   }
 }
