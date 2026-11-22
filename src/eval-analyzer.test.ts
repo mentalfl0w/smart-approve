@@ -684,6 +684,104 @@ test("extracts object-form tool.write targets without treating virtual destinati
   );
 });
 
+test("extracts object-form tool.write paths when content is a dynamic expression", () => {
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      "await tool.write({path:'xd://mcp__ssh_manager_ssh_execute',content:JSON.stringify({server:'raspberrypicm4',command:'uname -a'})})",
+    ),
+    {
+      paths: [],
+      dynamic: false,
+      cwdPaths: [],
+      cwdDynamic: false,
+      hostToolTargets: ["xd://mcp__ssh_manager_ssh_execute"],
+    },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": "agent://Main", "content": JSON.stringify({ message: "hi" }) });',
+    ),
+    { paths: [], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": ".env", "content": JSON.stringify({ secret: key }) });',
+    ),
+    { paths: [".env"], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": "xd://mcp__x", "content": `value=${JSON.stringify({ a: 1 })}` });',
+    ),
+    {
+      paths: [],
+      dynamic: false,
+      cwdPaths: [],
+      cwdDynamic: false,
+      hostToolTargets: ["xd://mcp__x"],
+    },
+  );
+  // Content strings are values, not additional write targets.
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": "xd://mcp__x", "content": JSON.stringify({ "path": "/etc/passwd" }) });',
+    ),
+    {
+      paths: [],
+      dynamic: false,
+      cwdPaths: [],
+      cwdDynamic: false,
+      hostToolTargets: ["xd://mcp__x"],
+    },
+  );
+  // A second path after the content value is still rejected as dynamic.
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": "xd://mcp__x", "content": JSON.stringify({ a: 1 }), "path": "/etc/passwd" });',
+    ),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+  // Regex literals can contain `}`; they must not close the object early.
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      'await tool.write({ "path": "xd://mcp__x", "content": /}/, "path": "/etc/passwd" });',
+    ),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+});
+
+test("detects write helpers hidden inside template and f-string interpolation", () => {
+  // The interpolated write executes when the content argument is evaluated.
+  assert.deepEqual(
+    extractEvalWriteTargets(
+      "await tool.write({path:'notes.md',content:`${write('/etc/passwd','x')}`})",
+    ),
+    {
+      paths: ["notes.md", "/etc/passwd"],
+      dynamic: false,
+      cwdPaths: [],
+      cwdDynamic: false,
+    },
+  );
+  // Interpolation outside the object argument is equally executable.
+  assert.deepEqual(
+    extractEvalWriteTargets("const hidden = `${write('.env', secret)}`;"),
+    { paths: [".env"], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets("const hidden = `${write(target, secret)}`;"),
+    { paths: [], dynamic: true, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets('const note = `write(".env", secret)`;', "js"),
+    { paths: [], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+  assert.deepEqual(
+    extractEvalWriteTargets('note = f"{write(\'.env\', secret)}"', "py"),
+    { paths: [".env"], dynamic: false, cwdPaths: [], cwdDynamic: false },
+  );
+});
+
 test("extracts literal and dynamic Eval working-directory changes", () => {
   assert.deepEqual(
     extractEvalWriteTargets('process.chdir("/etc"); await write("passwd", "secret")'),

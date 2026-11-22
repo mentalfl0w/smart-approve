@@ -531,6 +531,63 @@ test("eval: auto mode delegates object tool.write virtual targets without a conf
   assert.equal(h.selectChoices, null);
 });
 
+test("eval: auto mode sends object tool.write host-tool invocations to AI review", async () => {
+  const code =
+    "await tool.write({path:'xd://mcp__ssh_manager_ssh_execute'," +
+    "content:JSON.stringify({server:'raspberrypicm4',command:'uname -a'})})";
+  const allowed = makeHarness({ mode: "auto" });
+  const ok = await run(EvalToolGate, allowed, { language: "js", code });
+  assert.equal(ok.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+  assert.equal(allowed.selectChoices, null);
+
+  const blocked = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "allow" } },
+  );
+  const denied = await run(EvalToolGate, blocked, { language: "js", code });
+  assert.equal(denied.isError, true);
+  assert.equal(reasonOf(denied), "auto");
+  assert.equal(blocked.calls.analyze, 1);
+  assert.equal(blocked.calls.delegate, 0);
+});
+
+test("eval: template-interpolated content cannot hide a system write", async () => {
+  const h = makeHarness({ mode: "auto" });
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: "await tool.write({path:'notes.md',content:`${write('/etc/passwd','x')}`})",
+  });
+  assert.equal(r.isError, true);
+  assert.match(r.content[0].text, /^Blocked:/);
+  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.calls.delegate, 0);
+});
+
+test("eval: template-interpolated content cannot hide a protected write", async () => {
+  const h = makeHarness({ mode: "auto" });
+  h.selectResult = "Allow for this session";
+  const r = await run(EvalToolGate, h, {
+    language: "js",
+    code: "const hidden = `${write('.env', secret)}`;\n" +
+      "await tool.write({path:'notes.md',content:hidden})",
+  });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.delegate, 1);
+  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.selectChoices?.[0].length, 2);
+
+  const noUI = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const blocked = await run(EvalToolGate, noUI, {
+    language: "js",
+    code: "await tool.write({path:'notes.md',content:`${write(target, secret)}`})",
+  });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(noUI.calls.delegate, 0);
+});
+
 test("eval: object tool.write file targets still apply protected-path checks", async () => {
   const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
   const r = await run(EvalToolGate, h, {
