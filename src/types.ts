@@ -213,8 +213,10 @@ export interface DangerAnalysis {
   /** True if any matched behavior is in the regex-confident deny tier.  This
    *  is evidence for review, not an automatic verdict by itself. */
   denyTier: boolean;
-  /** True if any matched behavior is in the hard-block set. */
-  hardBlocked: boolean;
+  /** True if a matched behavior is critical enough that only a human may
+   *  decide: auto-mode verdicts never apply, the confirmation dialog is shown
+   *  whenever a UI exists, and the operation is blocked when it does not. */
+  requiresUserApproval: boolean;
   /** Statically identified as needing review even when no behavior label was
    *  matched.  It no longer bypasses the model or the allow-list. */
   requiresConfirmation?: boolean;

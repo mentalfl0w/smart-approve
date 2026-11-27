@@ -78,6 +78,9 @@ export interface ApprovalRequest {
   rememberScope: "session" | "both";
   /** Overrides the default "Dangerous command" dialog title. */
   title?: string;
+  /** Critical behavior: only the user may decide.  Auto-mode verdicts are
+   *  shown as advice but never applied; without a UI the call blocks. */
+  requiresUserApproval?: boolean;
   /** Persists a remembered decision for multi-target reviews.  When omitted,
    *  the flow writes the single memoryKey through the allow-list. */
   remember?: (choice: Exclude<RememberChoice, "none">) => void;
@@ -131,8 +134,8 @@ export class ApprovalFlow {
 
     if (signal?.aborted) return this.aborted();
 
-    // Remembered decisions are human decisions; hard blocks are checked by
-    // the caller before this flow runs and therefore always win.
+    // Remembered decisions are human decisions; they are honored before the
+    // analysis so an explicitly allowed command stays zero-interruption.
     if (config.rememberDecisions && request.memoryKey !== null) {
       if (allowList.isAllowed(request.toolName, request.memoryKey, request.cwd)) {
         logger.log(`${request.toolName}: remembered decision allows review`);
@@ -153,6 +156,12 @@ export class ApprovalFlow {
       logger.log(`${request.toolName}: blocked (no UI, autoInHeadless=false) — ${request.label}`);
       return this.block(request, "no-ui", t.blockedNoUI, t.decisionSourceAutoHeadless);
     }
+    // A critical behavior needs a human; without a UI no verdict can change
+    // the outcome, so do not spend a model call on it.
+    if (request.requiresUserApproval && !hasUI) {
+      logger.log(`${request.toolName}: blocked (critical behavior, no UI) — ${request.label}`);
+      return this.block(request, "no-ui", t.blockedNoUI, t.decisionSourceMandatoryReview);
+    }
 
     const analysis = await this.analyze(request, ctx, signal);
     if (signal?.aborted) return this.aborted();
@@ -166,6 +175,12 @@ export class ApprovalFlow {
       logger.log(
         `${request.toolName}: no usable model verdict (${config.llmAnalysis ? "analysis failed" : "analysis disabled"}) — ${request.label}`,
       );
+    }
+
+    if (request.requiresUserApproval) {
+      // The model verdict is advisory here; only the user decides.
+      logger.log(`${request.toolName}: critical behavior, user decision required — ${request.label}`);
+      return this.askUser(request, analysis, decision, ctx, signal);
     }
 
     if (autoMode) {
@@ -265,6 +280,7 @@ export class ApprovalFlow {
         ? t.decisionSourceNoVerdict
         : t.decisionSourceAnalysisDisabled;
     const body = [
+      ...(request.requiresUserApproval ? [t.requiresUserDecisionNote, ""] : []),
       analysisText ?? (config.llmAnalysis ? t.analysisUnavailable : t.analysisDisabled),
       "",
       sourceLine,

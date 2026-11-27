@@ -4,8 +4,8 @@
  * Turns a parsed LLM risk analysis into a verdict when mode is "auto".
  * The policy has no fallback verdict: when the model produced no usable
  * answer, `decide()` returns null and the approval flow asks the user
- * (interactive UI) or blocks (no UI).  Hard blocks still win before the
- * policy runs and are never overridable.
+ * (interactive UI) or blocks (no UI).  Operations flagged as requiring a
+ * user decision never reach this policy's verdict; they always ask.
  *
  * Kept as a pure class so the matrix is unit-testable without spawning omp.
  */

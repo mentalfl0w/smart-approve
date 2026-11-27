@@ -8,7 +8,7 @@ Covered execution surfaces:
 |---|---|---|
 | `bash` | OMP: same-name wrapper with native schema; Pi: `tool_call` gate | command analysis + model review + user decision or valid auto verdict |
 | `eval` | OMP: same-name wrapper with native schema; Pi: `tool_call` gate when present | static subprocess, host-tool invocation, and protected-file-write analysis + model review |
-| `write` / `edit` / `apply_patch` / `ast_edit` | `tool_call` target matching | system-sensitive files/devices hard-block; configured protected paths enter the same review flow |
+| `write` / `edit` / `apply_patch` / `ast_edit` | `tool_call` target matching | system-sensitive files/devices always require your confirmation; configured protected paths enter the same review flow |
 | `write proc://<name>` (OMP) | `tool_call` check for tracked interactive services | shell input always gated; Python/JavaScript also gated when Eval coverage is enabled; reviewed by the same flow |
 
 Operations with nothing flagged for review pass through with **zero interruption**. OMP's same-name Bash/Eval wrappers analyze the effective parameters and delegate to the native tools, so native background, PTY, service, kernel, cancellation, and result behavior stays intact.
@@ -23,18 +23,16 @@ In OMP, Bash's native schema carries `async`, `pty`, `name`, and `ready`; Smart 
 LLM calls bash / eval / write / edit / …
        │
    ToolGate / protected-path review — shared approval flow
-       ├─ hard-block (high-risk launches such as curl/ssh/sudo,
-       │  interpreter -c/-e, rm -rf, sensitive working dirs, fork bomb,
-       │  curl|sh, eval subprocess + destructive payload…) → block always
        ├─ nothing flagged for review → execute (zero interruption)
-       └─ reviewable operation
+       ├─ critical behavior (high-risk launch such as curl/ssh/sudo,
+       │  interpreter -c/-e, rm -rf, sensitive working dirs, fork bomb,
+       │  curl|sh, system file/device writes, eval subprocess + destructive
+       │  payload…) → you decide; the model analysis is advisory, and no
+       │  UI means a block
+       └─ other flagged operation
               ├─ remembered session/permanent decision → execute
-              ├─ no UI?
-              │    ├─ interactive → block
-              │    └─ auto without autoInHeadless → block
-              │
+              ├─ no UI? interactive → block; auto without autoInHeadless → block
               ├─ model analysis (native classifier/judge or chat RPC)
-              │
               ├─ auto mode
               │    ├─ valid verdict → allow or block by policy
               │    └─ no valid verdict → UI asks the user; no UI blocks
@@ -44,7 +42,7 @@ LLM calls bash / eval / write / edit / …
 ```
 
 On Pi, the hook authorizes the current mutable input and then returns control to the native tool; it does not recursively call `executeTool()`.
-Hard-block always wins — no allow-list entry, model verdict, or mode can override it.
+There is no static veto: every flagged operation ends in a human decision (or in a remembered decision that the human made earlier). Only the absence of a UI turns a review into a block.
 
 
 ## Modes and runtime switching
@@ -54,11 +52,11 @@ Two approval modes:
 | Mode | Dangerous operations |
 |---|---|
 | `interactive` (default) | Model analysis is shown in a dialog; you choose session-allow / permanent-allow / deny. A missing verdict is shown in the dialog; the decision still belongs to you |
-| `auto` | A valid model verdict decides: block or execute. No dialogs for automatic decisions (non-blocking notifications only); without a valid verdict, a UI session asks you and a headless session blocks |
+| `auto` | A valid model verdict decides ordinary flagged operations. Critical operations always ask you even in auto mode; a remembered decision still applies. Without a valid verdict, a UI session asks you and a headless session blocks |
 
-Configured protected-path writes go through the same flow: model analysis first, then the interactive dialog or a valid auto verdict. Matching a protected path is not by itself a mandatory human prompt. Recognized high-risk process launches, recursive force deletes, sensitive working directories, writes to system-sensitive files/devices, and system account-file references in Bash commands or spawned Eval arguments are hard-blocked.
+Configured protected-path writes go through the same flow: model analysis first, then the interactive dialog or a valid auto verdict. Matching a protected path is not by itself a mandatory human prompt. Recognized high-risk process launches, recursive force deletes, sensitive working directories, writes to system-sensitive files/devices, and system account-file references in Bash commands or spawned Eval arguments always require your confirmation in every mode.
 
-Headless/subagent sessions have no human to ask. Interactive mode blocks reviewable operations. Auto mode uses valid model verdicts only when `autoInHeadless` is enabled; with no valid verdict — or when `autoInHeadless` is disabled — the operation is blocked.
+Headless/subagent sessions have no human to ask. Interactive mode blocks reviewable operations. Auto mode uses valid model verdicts for ordinary flagged operations only when `autoInHeadless` is enabled; with no valid verdict — or when `autoInHeadless` is disabled — the operation is blocked. Critical operations always block in a headless session, because no one can confirm them.
 
 Switch at runtime from the TUI (or RPC client) — no restart needed, and the choice persists:
 
@@ -78,7 +76,7 @@ Auto-mode decision rules:
 - A valid model verdict is required for an automatic decision: a parseable `risk` and/or `recommend`. `recommend: "deny"` blocks; `risk` at or above `autoBlockRisk` blocks; `risk=high` but `recommend=allow` blocks (the stricter signal wins — command text is untrusted input).
 - No valid verdict (model chain failure, invalid answer, timeout, cancellation, or `llmAnalysis: false`): with a UI the user is asked; without a UI the operation is blocked. There is no regex fallback and no automatic allow.
 - Auto-mode approvals are **not** written to the allow-list (model verdicts can change; remembered approvals should stay human decisions).
-- Force-push to `main`/`master`/`production`/`prod`/`release`/`trunk` is a reviewed behavior, not a silent regex block. Hard-block rules always win.
+- Force-push to `main`/`master`/`production`/`prod`/`release`/`trunk` is a reviewed behavior, not a silent regex block. Critical behaviors always require the user's confirmation.
 
 ## Architecture
 
@@ -91,14 +89,14 @@ SmartApprove (orchestrator)
  ├─ AllowList            — session + permanent decision memory
  ├─ AutoDecisionPolicy   — pure auto-mode verdict rules (thresholds; no fallback verdict)
  ├─ ApprovalFlow         — shared allow-list → model → user/auto decision flow
- ├─ ToolGate (abstract, template method) — hard-block + safe pass-through + delegation
+ ├─ ToolGate (abstract, template method) — safe pass-through + delegation
  │    ├─ BashToolGate    — command analysis, cd-prefix cwd, native delegation
  │    └─ EvalToolGate    — code analysis (subprocess intent), native delegation
  ├─ EvalCodeBehaviorAnalyzer — static process and file-write intent checks
  └─ ProcInputGuard           — tracked OMP interactive service stdin
 ```
 
-`ToolGate` defines the invariant gate flow (hard-block → safe pass-through → `ApprovalFlow` → delegate). `ApprovalFlow` owns remembered decisions, the headless policy, model analysis, the interactive dialog, and auto-mode decisions; protected-path writes use it directly. Each concrete gate implements three hooks — `analyze()` / `buildKey()` / `delegate()` — plus its schema and subject extraction. Adding a new covered tool means adding one subclass, not touching the pipeline. Collaborators are injected as narrow interfaces (`AllowListLike`, `ModelInvokerLike`, `LoggerLike`), so the branch matrix is unit-testable without a running host.
+`ToolGate` defines the invariant gate flow (safe pass-through → `ApprovalFlow` → delegate). `ApprovalFlow` owns remembered decisions, the headless policy, model analysis, the interactive dialog, and auto-mode decisions; protected-path writes use it directly. Each concrete gate implements three hooks — `analyze()` / `buildKey()` / `delegate()` — plus its schema and subject extraction. Adding a new covered tool means adding one subclass, not touching the pipeline. Collaborators are injected as narrow interfaces (`AllowListLike`, `ModelInvokerLike`, `LoggerLike`), so the branch matrix is unit-testable without a running host.
 
 ## Model risk analysis: chat RPC and native decisions
 
@@ -148,25 +146,25 @@ Static analysis decides what evidence to hand the model. When a target cannot be
 - **Python**: `subprocess` (including `run`, `Popen`, `check_call`, and `check_output`), `asyncio.create_subprocess_*`, `os.system`/`os.popen`, `os.exec*`/`os.spawn*`, `os.fork`/`os.forkpty`, `os.posix_spawn*`, and `multiprocessing.Process` (including bare `Process` when multiprocessing is imported)
 - Literal executable arguments to `os.exec*`/`os.spawn*`/`os.posix_spawn*` are parsed for launch-head and interpreter-flag checks; computed executable targets remain a static-analysis limit.
 - Launch-head and interpreter-flag classification reuses the Bash command analyzer, including wrapper/quoting semantics; dangerous-argument matching remains Eval's separate joined-argument rule set.
-- When code shows actual process-spawn intent, launch executables and interpreter inline flags are checked on the parsed command head, while dangerous arguments are checked across the joined argument stream: high-risk executables (`osascript`, `sudo`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`), interpreters with `-c`/`-e`/`-i`/`--eval`/`--command`, `rm -rf` variants, `chmod`/`chown`, `dd ... of=...`, and `/etc/passwd`/`/etc/shadow`/`/etc/sudoers` references hard-block. A safe executable with a high-risk-looking argument, such as `Bun.spawn(["echo", "ssh"])`, stays reviewable.
+- When code shows actual process-spawn intent, launch executables and interpreter inline flags are checked on the parsed command head, while dangerous arguments are checked across the joined argument stream: high-risk executables (`osascript`, `sudo`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`), interpreters with `-c`/`-e`/`-i`/`--eval`/`--command`, `rm -rf` variants, `chmod`/`chown`, `dd ... of=...`, and `/etc/passwd`/`/etc/shadow`/`/etc/sudoers` references require your confirmation. A safe executable with a high-risk-looking argument, such as `Bun.spawn(["echo", "ssh"])`, stays reviewable.
 - Python cells: `!cmd` and `var = !cmd` shell escapes plus `%%bash` count as spawn intent; their literal shell text (with backslash continuations folded as the runner does) goes through the same launch-head, dangerous-argument, and destructive-payload checks. `%%writefile` targets enter Eval write-path checks and its body is treated as file content, not shell text. `%cd` targets enter cwd checks in source order with `chdir`.
 - `%run` and `%load` execute external file source that cannot be inspected statically; they are routed to model review instead of claiming static coverage, and no remembered decision is offered because the file can change.
-- Literal `process.chdir`/`os.chdir`/`Dir.chdir`/`%cd` targets are resolved against the effective base; a target inside a sensitive system directory hard-blocks unless the session root contains it (the legacy outside-session exception). Lexical and canonical candidates cover symlinked `~/.ssh`/`~/.gnupg`. Computed chdir targets are not resolved; relative writes after a dynamic working directory require review, and such a cell does not offer a remembered decision.
-- A leading `cd <path>` inside `!cmd`/`%%bash` is resolved against the effective base cwd; sensitive targets hard-block. Unresolved expansion or a target that is not an existing directory leaves the shell cwd unknown and routes later relative operations to review; no remembered decision is offered. Later absolute sensitive targets are still checked.
-- Destructive payloads combined with spawn intent remain hard-blocked. A plain spawn such as `Bun.spawn(["ls"])` stays reviewable.
+- Literal `process.chdir`/`os.chdir`/`Dir.chdir`/`%cd` targets are resolved against the effective base; a target inside a sensitive system directory requires your confirmation unless the session root contains it (the legacy outside-session exception). Lexical and canonical candidates cover symlinked `~/.ssh`/`~/.gnupg`. Computed chdir targets are not resolved; relative writes after a dynamic working directory require review, and such a cell does not offer a remembered decision.
+- A leading `cd <path>` inside `!cmd`/`%%bash` is resolved against the effective base cwd; sensitive targets require your confirmation. Unresolved expansion or a target that is not an existing directory leaves the shell cwd unknown and routes later relative operations to review; no remembered decision is offered. Later absolute sensitive targets are still checked.
+- Destructive payloads combined with spawn intent always require your confirmation. A plain spawn such as `Bun.spawn(["ls"])` stays reviewable.
 - OMP package-manager magic cells (`%pip install`, `%bun add`) count as spawn intent and stay reviewable; their package specifiers are not scanned as shell commands.
 - Eval approvals offer session-allow only. OMP native kernel state, output truncation, cancellation, and cell results remain with the native Eval tool.
 
 ### 3. Process-launch behavior analysis
 
-The Bash analyzer hard-blocks these launch shapes — no LLM review, no allow-list override:
+The Bash analyzer marks these launch shapes as critical, so they always require your confirmation:
 
 - high-risk executables (`osascript`, `sudo`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`);
 - interpreters used with `-c`, `-e`, `-i`, `--eval`, or `--command`, while ordinary script launches such as `python3 app.py` and `bun run dev` stay uninterrupted;
 - `chmod`/`chown`, `rm -rf` variants (including `rm -r -f` and long forms), `dd ... of=...`, and sensitive working directories outside the session root;
 - `mkfs`, shutdown/reboot, raw block-device writes, root deletion, fork bombs, remote fetch-and-execute, and `/etc/passwd`/`/etc/shadow`/`/etc/sudoers` references.
 
-Force-push to a protected branch is reviewed by the model, distinct from these hard blocks. Eval subprocess code (including Python `!` escapes and `%%bash`) receives static process-intent, sensitive-working-directory, and destructive-payload checks. Reviewable operations use the model: interactive mode shows the analysis and lets the user decide; auto mode applies a valid verdict, asks in a UI when there is none, and blocks headless without one.
+Force-push to a protected branch is reviewed by the model, distinct from these critical behaviors. Eval subprocess code (including Python `!` escapes and `%%bash`) receives static process-intent, sensitive-working-directory, and destructive-payload checks. Reviewable operations use the model: interactive mode shows the analysis and lets the user decide; auto mode applies a valid verdict to ordinary operations, always asks the user for critical ones, and blocks headless without a UI.
 
 ### 4. Protected paths and Eval file writes
 
@@ -196,11 +194,11 @@ The interactive dialog offers three choices (two for eval):
 
 Keys are scoped to `tool + normalized-content + cwd`, so the same command in a different project still triggers review. When the UI doesn't support `select`, it degrades to a simple `confirm` (two-way).
 
-Remembered decisions are checked before model analysis; hard blocks always win over them. Operations whose actual target depends on runtime state (an unresolved working directory, a dynamically dispatched host tool, a write target that cannot be resolved statically, or `%run`/`%load` source that can change) are still reviewed but do not offer a remembered decision, and existing remembered entries do not cover them.
+Remembered decisions are checked before model analysis and apply to every flagged operation, including critical ones: an explicit human choice is never overridden by static analysis. Operations whose actual target depends on runtime state (an unresolved working directory, a dynamically dispatched host tool, a write target that cannot be resolved statically, or `%run`/`%load` source that can change) are still reviewed but do not offer a remembered decision, and existing remembered entries do not cover them.
 
-### 6. Hard-block behaviors
+### 6. Critical behaviors that always require your confirmation
 
-Always hard-blocked — no LLM review, no dialog, no allow-list override. Bash rules apply to command text; Eval launch/payload rules apply when process-spawn intent is detected.
+These behaviors have no auto verdict and no static block: the model analysis is shown as advice, the dialog lets you choose session-allow / permanent-allow / deny, and a headless session blocks because nobody can confirm. Bash rules apply to command text; Eval launch/payload rules apply when process-spawn intent is detected.
 
 - High-risk executables (`osascript`, `sudo`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`)
 - Interpreters invoked with inline-code flags (`-c`, `-e`, `-i`, `--eval`, `--command`)
@@ -217,7 +215,7 @@ Always hard-blocked — no LLM review, no dialog, no allow-list override. Bash r
 - eval: subprocess intent (including `!cmd` and `%%bash`) combined with any recognized high-risk launch target, dangerous argument, or destructive payload above
 - eval: literal `chdir`/`%cd` or leading shell `cd` in `!cmd`/`%%bash` into a sensitive system directory; relative targets must also resolve outside the session root
 
-Protected-branch force-push is reviewed by the model, not hard-blocked.
+Protected-branch force-push is reviewed by the model, not a critical behavior.
 
 ### 7. Native execution and result preservation
 
@@ -237,10 +235,10 @@ The extension never executes shell commands or Eval cells itself. OMP's same-nam
 - MCP namespace recognition depends on the live host tool inventory exposing `mcpServerName` (OMP does while connected, including when `mcp.evalNamespaces` hides the server's top-level tools). If the inventory is unavailable, direct `tool.mcp__*` still matches the MCP prefix, but a non-prefixed namespace global cannot be attributed; a dynamic `tool[...]` dispatch is still routed to review. Globals that OMP renamed on a collision (for example `github_mcp`) are not reconstructed from the server name.
 - Eval MCP detection follows the submitted source text. Exotic indirection such as `globalThis["tool"]`, `getattr(tool, name)`, passing `tool` to a helper, or aliasing a namespace through another object is not classified. The gate is not a sandbox; review the cell rather than relying on a claim of complete MCP coverage.
 - Proc-service cwd is inferred from literal `cd`/`chdir` input after a successful `write proc://` result. OMP reports that input was sent, not whether a conditional or failing command changed cwd; indirect changes can desynchronize the inferred path. Unknown cwd is routed to review; without a valid verdict a UI session asks the user and a headless session blocks.
-- Eval code runs in a retained kernel, but the host resets the runner working directory to the session cwd before each cell, so a `chdir` does not carry into later cells. Literal `chdir`/`%cd` operations are resolved in source order for the hard-block check; computed targets are not resolved against the live runtime directory. A leading shell `cd` inside `!cmd`/`%%bash` is resolved against the effective base cwd. Same-cell dynamic `chdir` with relative writes remains review-worthy rather than statically classified. This is a gate on each submitted snippet, not live filesystem interception.
-- Python `%%writefile` targets are checked, but its body is file content, not shell code. A shell `cd` target that cannot be resolved before execution (for example, a symlink created earlier in the same input) requires review rather than a no-override hard block.
-- Bash hard-blocks file operands for `/etc/passwd`, `/etc/shadow`, and `/etc/sudoers`, including reads. Grep/rg patterns, sed/awk programs, and Git messages/search terms count as data.
-- Eval hard-blocks those references only when code shows spawn intent. Other system files do not all share that rule.
+- Eval code runs in a retained kernel, but the host resets the runner working directory to the session cwd before each cell, so a `chdir` does not carry into later cells. Literal `chdir`/`%cd` operations are resolved in source order for the critical-behavior check; computed targets are not resolved against the live runtime directory. A leading shell `cd` inside `!cmd`/`%%bash` is resolved against the effective base cwd. Same-cell dynamic `chdir` with relative writes remains review-worthy rather than statically classified. This is a gate on each submitted snippet, not live filesystem interception.
+- Python `%%writefile` targets are checked, but its body is file content, not shell code. A shell `cd` target that cannot be resolved before execution (for example, a symlink created earlier in the same input) requires review rather than an automatic decision.
+- Bash flags file operands for `/etc/passwd`, `/etc/shadow`, and `/etc/sudoers`, including reads. Grep/rg patterns, sed/awk programs, and Git messages/search terms count as data.
+- Eval requires your confirmation for those references only when code shows spawn intent. Other system files do not all share that rule.
 - OMP TUI `!`/`!!` shell commands (`user_bash`) and RPC `bash` are separate session-level execution paths, not registry `tool_call` invocations. Smart Approve covers model-facing Bash tool calls; these user-owned shell entrypoints are not gated by this extension.
 - OMP proc stdin protection covers only interactive shell/Python/JavaScript services started through Smart Approve in the same workspace. When `coverage.eval` is false, only shell input is gated. Other process types, services started before the extension, and detached services after a host restart are not tracked; their stdin passes through unchanged.
 - `ast_edit` path protection checks explicit paths. Directory/glob expansion is owned by OMP and is not expanded by this extension; broad scopes can include protected files. The later `xd://resolve` request does not expose its resolved target list.
@@ -248,7 +246,7 @@ The extension never executes shell commands or Eval cells itself. OMP's same-nam
 - Pi runs `tool_call` handlers in extension load order and mutates `event.input` in place; its Bash/Eval gates are load-order-sensitive. Load Smart Approve after extensions that rewrite Bash/Eval input; a later mutating handler can otherwise change arguments after approval.
 - OMP `ctx.invokeTool()` exists only when a same-name native built-in is available. If a host advertises the wrapper but does not provide that public delegate, Smart Approve returns a delegation error rather than using a non-native execution fallback.
 - This extension does not shadow top-level MCP tools, `github`, `debug`, `browser`, or `computer`. It covers MCP only when reached from an Eval cell (direct `tool.mcp__*`, MCP namespace globals, static `xd://` device writes); direct calls to those tools outside Eval keep their own host approval policy. `debug` has a native approval prompt available (`tools.approval.debug: prompt`); recommend the same for any other tool you want gated natively.
-- Permanent allow-list entries predate rule upgrades; hard-blocks always win over them.
+- Permanent allow-list entries predate rule upgrades; an explicit human decision is honored over static analysis.
 
 ## Install
 
@@ -302,11 +300,11 @@ The legacy `coverage.hub` key is ignored. `autoFallback` is a legacy key: it is 
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Master switch |
-| `mode` | `"interactive"` | `"interactive"` (model recommendation + dialog) or `"auto"` (valid model verdict decides, no dialogs). Switchable at runtime via `/smart-approve` |
+| `mode` | `"interactive"` | `"interactive"` (model recommendation + dialog) or `"auto"` (valid model verdict decides ordinary operations; critical operations always ask). Switchable at runtime via `/smart-approve` |
 | `autoBlockRisk` | `"high"` | Auto mode: a valid model verdict with risk at or above this level blocks (`"high"` or `"medium"`) |
-| `autoInHeadless` | `false` | Auto mode in headless/subagent sessions: a valid model verdict may decide. With no valid verdict, the operation is blocked |
+| `autoInHeadless` | `false` | Auto mode in headless/subagent sessions: a valid model verdict may decide ordinary operations. With no valid verdict, or for a critical operation, the operation is blocked |
 | `coverage.eval` | `true` | Enable Eval analysis when the host exposes an Eval tool |
-| `protectedPaths` | 20+ built-in patterns | Glob patterns checked for write/edit/apply_patch/ast_edit and literal Eval helper writes. A match enters the normal review flow; system-sensitive files/devices remain hard-blocked even when empty |
+| `protectedPaths` | 20+ built-in patterns | Glob patterns checked for write/edit/apply_patch/ast_edit and literal Eval helper writes. A match enters the normal review flow; system-sensitive files/devices always require your confirmation even when empty |
 | `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = static rules only. Reviewable operations then have no model verdict: a UI session asks the user and a headless session blocks |
 | `rememberDecisions` | `true` | Whether to offer remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the model |
@@ -362,7 +360,7 @@ smart-approve/
 ├── src/
 │   ├── index.ts          ← SmartApprove orchestrator: wiring + commands + protected-path/proc hooks
 │   ├── approval.ts       ← ApprovalFlow (allow-list → model → user/auto decision)
-│   ├── gate.ts           ← ToolGate (hard-block + ApprovalFlow + delegation) + dep contracts
+│   ├── gate.ts           ← ToolGate (approval flow + delegation) + dep contracts
 │   ├── bash-tool.ts      ← OMP BashToolGate wrapper; Pi uses native tool_call gate
 │   ├── eval-tool.ts      ← OMP EvalToolGate wrapper; Pi uses native tool_call gate
 │   ├── policy.ts         ← AutoDecisionPolicy (auto-mode verdict rules; no fallback)

@@ -1451,7 +1451,7 @@ function splitShellSegments(command: string): string[] {
  * Literal command text for recognized spawn APIs.  Shell-string calls yield
  * their command; argv calls yield their string elements in order, so the
  * first token is the executable the host actually launches.  Non-literal
- * arguments yield no head and therefore no launch hard block.
+ * arguments yield no head and therefore no launch review trigger.
  */
 function extractSpawnCommandText(code: string, childProcessImport: boolean): string[] {
   const commands = new Set<string>();
@@ -1520,8 +1520,8 @@ function extractSpawnCommandText(code: string, childProcessImport: boolean): str
 /**
  * Analyzes eval-tool code snippets (JS/TS, Python, embedded shell) for
  * subprocess / system-command intent and static working-directory escapes,
- * purely by text patterns.  Legacy launch shapes hard-block only when the
- * code shows spawn intent and only on the parsed command head; legacy
+ * purely by text patterns.  Legacy launch shapes require a user decision only
+ * when the code shows spawn intent and only on the parsed command head; legacy
  * dangerous arguments are matched across the joined argument stream.  A
  * plain spawn stays reviewable.  Python shell magics add spawn intent and
  * literal shell text; `%run`/`%load` require confirmation because their
@@ -1677,7 +1677,7 @@ export class EvalCodeBehaviorAnalyzer {
       found.has("eval-dynamic-host-tool-invocation");
     if (pythonScan?.externalSource) found.add("eval-external-source");
 
-    const hardBlocked =
+    const requiresUserApproval =
       dangerousPayload || riskyLaunch || riskyArguments || sensitiveCwd || shellSensitiveCwd;
 
     const behaviors = [...found];
@@ -1685,7 +1685,7 @@ export class EvalCodeBehaviorAnalyzer {
     const analysis: DangerAnalysis = {
       behaviors,
       labels,
-      hardBlocked,
+      requiresUserApproval,
       // A statically identified MCP call has no regex-level safe/unsafe verdict.
       // When no model verdict is available, auto mode must not infer safety.
       denyTier: found.has("eval-mcp-tool-invocation"),
