@@ -139,8 +139,14 @@ function splitShellCommands(command: string): string[] {
     if (ch === ";" || ch === "|" || ch === "&" || ch === "\n" || ch === "(" || ch === ")") {
       const segment = command.slice(start, i).trim();
       if (segment) result.push(segment);
-      start = i + 1;
-      if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
+      // `&&`, `||`, and `|&` are single separators. Consume both characters
+      // so the next segment starts at the following command instead of the
+      // operator, which `commandAndArgs` would otherwise treat as the
+      // executable and stop at.
+      const doubled = (ch === "|" || ch === "&") &&
+        (command[i + 1] === ch || (ch === "|" && command[i + 1] === "&"));
+      start = i + (doubled ? 2 : 1);
+      if (doubled) i++;
     }
   }
 
@@ -993,11 +999,12 @@ function analyzeGit(args: string[]): string[] {
 
 // ── Composite analysis ───────────────────────────────────────────────
 
-/** Behaviors that are always hard-blocked (no LLM review, no allow).
- *  These mirror the former HubLaunchGuard's no-override rejections:
- *  legacy high-risk launches, destructive filesystem commands, and
- *  sensitive working directories. */
-const HARD_BLOCK_BEHAVIORS: Record<string, true> = {
+/** Behaviors that always require a human decision.
+ *
+ *  Auto-mode verdicts never apply to them: with a UI the confirmation dialog
+ *  is shown (carrying the model's advisory analysis); without a UI the
+ *  operation blocks, because nobody can confirm it. */
+const MANDATORY_REVIEW_BEHAVIORS: Record<string, true> = {
   "recursive-force-delete": true,
   "delete-root": true,
   "fork-bomb": true,
@@ -1015,8 +1022,9 @@ const HARD_BLOCK_BEHAVIORS: Record<string, true> = {
 };
 
 /** Deny-tier behaviors: regex-confident enough to block without an LLM
- *  verdict when auto mode falls back to regex-only decisions.  Hard-blocked
- *  commands never report deny tier — the harder tier wins. */
+ *  verdict when auto mode falls back to regex-only decisions.
+ *  Mandatory-review commands never report deny tier; the human decision
+ *  takes precedence. */
 const DENY_TIER_BEHAVIORS: Record<string, true> = {
   "git-force-push-protected": true,
 };
@@ -1180,11 +1188,12 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
 
   const behaviors = [...behaviorSet];
   const labels = behaviors.map((behavior) => BEHAVIORS[behavior] || makeLabel(behavior, behavior));
-  const hardBlocked = behaviors.some((behavior) => behavior in HARD_BLOCK_BEHAVIORS);
-  const denyTier =
-    !hardBlocked && behaviors.some((behavior) => behavior in DENY_TIER_BEHAVIORS);
+  const requiresUserApproval = behaviors.some((behavior) =>
+    behavior in MANDATORY_REVIEW_BEHAVIORS
+  );
+  const denyTier = behaviors.some((behavior) => behavior in DENY_TIER_BEHAVIORS);
 
-  return { behaviors, labels, hardBlocked, denyTier };
+  return { behaviors, labels, requiresUserApproval, denyTier };
 }
 
 /** Analyze a command plus its explicit execution cwd. */
@@ -1198,5 +1207,5 @@ export function analyzeBashOperation(command: string, cwd: string, sessionCwd: s
   const labels = behaviors === analysis.behaviors
     ? analysis.labels
     : [...analysis.labels, BEHAVIORS["sensitive-working-directory"]];
-  return { ...analysis, behaviors, labels, hardBlocked: true, denyTier: false };
+  return { ...analysis, behaviors, labels, requiresUserApproval: true, denyTier: false };
 }

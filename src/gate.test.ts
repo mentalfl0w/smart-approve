@@ -236,7 +236,7 @@ test("bash: only the first leading cd target determines the effective cwd", asyn
   assert.equal(commented.calls.delegate, 0);
 });
 
-test("bash: literal cd segments entering sensitive directories are hard-blocked", async () => {
+test("bash: literal cd segments entering sensitive directories require confirmation", async () => {
   for (const command of [
     "cd /etc; touch marker",
     "cd /tmp && cd /etc && touch marker",
@@ -245,11 +245,12 @@ test("bash: literal cd segments entering sensitive directories are hard-blocked"
     "cd -- /etc && touch marker",
   ]) {
     const h = makeHarness();
+    h.selectResult = "Allow for this session";
     const r = await run(BashToolGate, h, { command });
-    assert.equal(r.isError, true, command);
-    assert.deepEqual(r.details, { blocked: true, reason: blockedLabel(r) }, command);
-    assert.equal(h.calls.analyze, 0, command);
-    assert.equal(h.calls.delegate, 0, command);
+    assert.equal(r.content[0].text, "native-run", command);
+    assert.equal(h.calls.analyze, 1, command);
+    assert.equal(h.calls.delegate, 1, command);
+    assert.match(h.selectTitle ?? "", /sensitive directory/, command);
   }
 
   // A literal, non-sensitive cd followed by `;` should not demand confirmation.
@@ -334,13 +335,54 @@ test("bash: unresolved dynamic cwd is model-reviewed but never remembered", asyn
   assert.equal(dynamicParam.calls.delegate, 0);
 });
 
-test("bash: hard-block wins over everything", async () => {
-  const h = makeHarness({}, { isAllowed: true });
+test("bash: critical behaviors ask the user even in auto mode", async () => {
+  const h = makeHarness({ mode: "auto" });
+  h.selectResult = "Allow for this session";
   const r = await run(BashToolGate, h, { command: "rm -rf /" });
-  assert.equal(r.isError, true);
-  assert.deepEqual(r.details, { blocked: true, reason: blockedLabel(r) });
-  assert.equal(h.calls.delegate, 0);
-  assert.equal(h.calls.analyze, 0);
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.delegate, 1);
+  assert.equal(h.calls.analyze, 1);
+  assert.notEqual(h.selectChoices, null);
+  assert.match(h.selectTitle ?? "", /Recursive force delete/);
+  assert.match(h.calls.selectBodies[0], /always requires your decision/);
+
+  // A temporary-directory target is not exempt: the user still decides.
+  const temp = makeHarness({ mode: "auto" });
+  temp.selectResult = "Allow for this session";
+  const tempResult = await run(BashToolGate, temp, { command: "rm -rf /tmp/build" });
+  assert.equal(tempResult.content[0].text, "native-run");
+  assert.equal(temp.calls.analyze, 1);
+  assert.equal(temp.calls.delegate, 1);
+  assert.match(temp.selectTitle ?? "", /Recursive force delete/);
+
+  // A model veto is advisory too: the user can still allow, and a deny
+  // verdict never turns into an automatic block.
+  const veto = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "deny" } },
+  );
+  veto.selectResult = "Allow for this session";
+  const vetoResult = await run(BashToolGate, veto, { command: "rm -rf /tmp/build" });
+  assert.equal(vetoResult.content[0].text, "native-run");
+  assert.equal(veto.calls.analyze, 1);
+  assert.equal(veto.calls.delegate, 1);
+  assert.match(veto.calls.selectBodies[0], /Risk: high/);
+
+  // A headless auto session cannot present the question, so it must block
+  // even when autoInHeadless would accept a model verdict.
+  const headless = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const blocked = await run(BashToolGate, headless, { command: "rm -rf /" });
+  assert.equal(blocked.isError, true);
+  assert.deepEqual(blocked.details, { blocked: true, reason: "no-ui" });
+  assert.equal(headless.calls.analyze, 0);
+  assert.equal(headless.calls.delegate, 0);
+
+  // A remembered human decision is still honored without a dialog.
+  const remembered = makeHarness({}, { isAllowed: true });
+  const allowed = await run(BashToolGate, remembered, { command: "rm -rf /" });
+  assert.equal(allowed.content[0].text, "native-run");
+  assert.equal(remembered.calls.delegate, 1);
+  assert.equal(remembered.calls.analyze, 0);
 });
 
 test("bash: allowlist hit delegates without dialog", async () => {
@@ -541,12 +583,18 @@ test("bash: remote-tracking branch delete keeps review under an accurate label",
   }
 });
 
-test("bash: rmdir root keeps the baseline hard block while ordinary targets pass", async () => {
+test("bash: rmdir root requires confirmation while ordinary targets pass", async () => {
   const root = makeHarness();
-  const blocked = await run(BashToolGate, root, { command: "rmdir /" });
+  root.selectResult = "Allow for this session";
+  const allowed = await run(BashToolGate, root, { command: "rmdir /" });
+  assert.equal(allowed.content[0].text, "native-run");
+  assert.match(root.selectTitle ?? "", /Recursive force delete/);
+  assert.equal(root.calls.delegate, 1);
+
+  const denied = makeHarness();
+  const blocked = await run(BashToolGate, denied, { command: "rmdir /" });
   assert.equal(blocked.isError, true);
-  assert.equal(blockedLabel(blocked), "Recursive force delete (rm -rf)");
-  assert.equal(root.calls.delegate, 0);
+  assert.equal(denied.calls.delegate, 0);
 
   const ordinary = makeHarness();
   const r = await run(BashToolGate, ordinary, { command: "rmdir /var/empty" });
@@ -798,14 +846,16 @@ test("eval: xd host-tool writes cannot be auto-allowed without a model verdict",
 
 test("eval: template-interpolated content cannot hide a system write", async () => {
   const h = makeHarness({ mode: "auto" });
+  h.selectResult = "Allow for this session";
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: "await tool.write({path:'notes.md',content:`${write('/etc/passwd','x')}`})",
   });
-  assert.equal(r.isError, true);
-  assert.match(r.content[0].text, /^Blocked:/);
-  assert.equal(h.calls.analyze, 0);
-  assert.equal(h.calls.delegate, 0);
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+  assert.match(h.selectTitle ?? "", /Eval writes a system-sensitive file/);
+  assert.equal(h.selectChoices?.[0].length, 2);
 });
 
 test("eval: template-interpolated content cannot hide a protected write", async () => {
@@ -942,57 +992,62 @@ test("eval: abort while the confirm dialog is open neither executes nor remember
   assert.equal(h.calls.permanent.length, 0);
 });
 
-test("eval hard-blocks sensitive system-file writes without subprocess intent", async () => {
+test("eval reviews sensitive system-file writes without subprocess intent", async () => {
   const h = makeHarness();
+  h.selectResult = "Allow for this session";
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'await write("/etc/sudoers.d/agent", "secret")',
   });
-  assert.equal(r.isError, true);
-  assert.match(r.content[0].text, /^Blocked:/);
-  assert.equal(h.calls.analyze, 0);
-  assert.equal(h.calls.delegate, 0);
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+  assert.match(h.calls.selectBodies[0], /always requires your decision/);
 });
-test("eval hard-blocks system-sensitive positional tool.write targets", async () => {
+
+test("eval blocks system-sensitive positional tool.write targets without a UI", async () => {
   const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'await tool.write("/etc/passwd", "secret")',
   });
   assert.equal(r.isError, true);
-  assert.notEqual(reasonOf(r), "no-ui");
-  assert.match(r.content[0].text, /^Blocked:/);
+  assert.equal(reasonOf(r), "no-ui");
+  assert.match(r.content[0].text, /Review required/);
   assert.equal(h.calls.analyze, 0);
   assert.equal(h.calls.delegate, 0);
 });
 
-test("eval hard-blocks symlink aliases of system-sensitive files", async () => {
+test("eval reviews symlink aliases of system-sensitive files", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-eval-link-"));
   try {
     const alias = path.join(dir, "passwd");
     fs.symlinkSync("/etc/passwd", alias);
     const h = makeHarness();
+    h.selectResult = "Allow for this session";
     const r = await run(EvalToolGate, h, {
       language: "js",
       code: `await write(${JSON.stringify(alias)}, "secret")`,
     });
-    assert.equal(r.isError, true);
-    assert.match(r.content[0].text, /^Blocked:/);
-    assert.equal(h.calls.delegate, 0);
+    assert.equal(r.content[0].text, "native-run");
+    assert.equal(h.calls.analyze, 1);
+    assert.equal(h.calls.delegate, 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("eval hard-blocks relative writes after changing into a sensitive directory", async () => {
+test("eval reviews relative writes after changing into a sensitive directory", async () => {
   const h = makeHarness();
+  h.selectResult = "Allow for this session";
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'process.chdir("/etc"); await write("passwd", "secret")',
   });
-  assert.equal(r.isError, true);
-  assert.match(r.content[0].text, /^Blocked:/);
-  assert.equal(h.calls.delegate, 0);
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+  assert.match(h.selectTitle ?? "", /Changes into a sensitive system directory/);
 });
 
 test("eval: relative writes after a dynamic directory change go through the model", async () => {
@@ -1018,14 +1073,15 @@ test("eval: relative writes after a dynamic directory change go through the mode
 });
 test("eval gates Python shell magics and writefile targets", async () => {
   const shell = makeHarness();
-  const blockedShell = await run(EvalToolGate, shell, {
+  shell.selectResult = "Allow for this session";
+  const reviewedShell = await run(EvalToolGate, shell, {
     language: "py",
     code: "!ssh host",
   });
-  assert.equal(blockedShell.isError, true);
-  assert.match(blockedShell.content[0].text, /^Blocked:/);
-  assert.equal(shell.calls.analyze, 0);
-  assert.equal(shell.calls.delegate, 0);
+  assert.equal(reviewedShell.content[0].text, "native-run");
+  assert.equal(shell.calls.analyze, 1);
+  assert.equal(shell.calls.delegate, 1);
+  assert.match(shell.calls.selectBodies[0], /always requires your decision/);
 
   const protectedWrite = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
   const allowedWrite = await run(EvalToolGate, protectedWrite, {
@@ -1050,22 +1106,26 @@ test("eval gates Python shell magics and writefile targets", async () => {
   assert.equal(noVerdict.calls.delegate, 0);
 
   const systemWrite = makeHarness();
-  const blockedSystemWrite = await run(EvalToolGate, systemWrite, {
+  systemWrite.selectResult = "Allow for this session";
+  const reviewedSystemWrite = await run(EvalToolGate, systemWrite, {
     language: "py",
     code: "%%writefile /etc/passwd\nsecret",
   });
-  assert.equal(blockedSystemWrite.isError, true);
-  assert.match(blockedSystemWrite.content[0].text, /^Blocked:/);
-  assert.equal(systemWrite.calls.delegate, 0);
+  assert.equal(reviewedSystemWrite.content[0].text, "native-run");
+  assert.equal(systemWrite.calls.analyze, 1);
+  assert.equal(systemWrite.calls.delegate, 1);
+  assert.match(systemWrite.selectTitle ?? "", /Eval writes a system-sensitive file/);
 
   const sensitiveCwd = makeHarness();
-  const blockedCwd = await run(EvalToolGate, sensitiveCwd, {
+  sensitiveCwd.selectResult = "Allow for this session";
+  const reviewedCwd = await run(EvalToolGate, sensitiveCwd, {
     language: "py",
     code: "%cd /etc",
   });
-  assert.equal(blockedCwd.isError, true);
-  assert.match(blockedCwd.content[0].text, /^Blocked:/);
-  assert.equal(sensitiveCwd.calls.delegate, 0);
+  assert.equal(reviewedCwd.content[0].text, "native-run");
+  assert.equal(sensitiveCwd.calls.analyze, 1);
+  assert.equal(sensitiveCwd.calls.delegate, 1);
+  assert.match(sensitiveCwd.selectTitle ?? "", /Changes into a sensitive system directory/);
 });
 
 test("eval external Python source and unresolved proc cwd go through the model", async () => {
@@ -1121,13 +1181,24 @@ test("eval external Python source and unresolved proc cwd go through the model",
 });
 
 
-test("eval: subprocess + dangerous payload hard-blocks", async () => {
+test("eval: subprocess + dangerous payload requires a user decision", async () => {
   const h = makeHarness();
+  h.selectResult = "Allow for this session";
   const r = await run(EvalToolGate, h, { language: "js", code: 'await Bun.$`rm -rf /`' });
-  assert.equal(r.isError, true);
-  assert.match(r.content[0].text, /^Blocked:/);
-  assert.equal(h.calls.delegate, 0);
-  assert.equal(h.calls.analyze, 0);
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 1);
+  assert.equal(h.calls.delegate, 1);
+  assert.equal(h.selectChoices?.[0].length, 2);
+  assert.match(h.calls.selectBodies[0], /always requires your decision/);
+
+  const headless = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const blocked = await run(EvalToolGate, headless, {
+    language: "js",
+    code: 'await Bun.$`rm -rf /`',
+  });
+  assert.equal(blocked.isError, true);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(headless.calls.delegate, 0);
 });
 
 test("eval: subprocess code asks via two-choice dialog", async () => {

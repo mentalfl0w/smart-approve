@@ -510,6 +510,59 @@ test("protected path reviews honor a remembered session choice", async () => {
   });
 });
 
+test("system-sensitive file writes always require a user decision", async () => {
+  await withTemporaryHome(async (home) => {
+    fs.writeFileSync(
+      path.join(home, ".omp", "agent", "smart-approve.json"),
+      JSON.stringify({ mode: "auto", autoInHeadless: true, llmAnalysis: false }),
+    );
+    const host = makeHost([
+      builtin("bash", { native: "bash" }),
+      builtin("eval", { native: "eval" }),
+      builtin("write", { native: "write" }),
+    ]);
+    smartApprove(host.api);
+    const uiCtx = makeContext(host.delegated, host.notices, true);
+    await host.initialize(uiCtx);
+    const selectTitles: string[] = [];
+    const select = uiCtx.ui.select!;
+    uiCtx.ui.select = async (title: string, choices: string[]) => {
+      selectTitles.push(title);
+      return select(title, choices);
+    };
+    const callHandler = host.handlers.get("tool_call")!.at(-1)!;
+    const t = getI18n(detectLang());
+
+    // Auto mode does not auto-decide a critical write; the user does.
+    const reviewed = await callHandler(
+      { toolName: "write", input: { path: "/etc/passwd", content: "malicious" } },
+      uiCtx,
+    );
+    assert.equal(reviewed, undefined);
+    assert.equal(selectTitles.length, 1);
+    assert.match(selectTitles[0], /system-sensitive|系统敏感/i);
+    assert.ok(selectTitles[0].includes(t.requiresUserDecisionNote));
+
+    // No UI means nobody can confirm, so even autoInHeadless blocks.
+    const headlessCtx = makeContext(
+      host.delegated,
+      host.notices,
+      false,
+      "headless-session",
+      "/work/other",
+    );
+    const blocked = await callHandler(
+      { toolName: "write", input: { path: "/etc/passwd", content: "malicious" } },
+      headlessCtx,
+    );
+    if (!isBlocked(blocked)) assert.fail("expected a system-sensitive write to block headless");
+    assert.ok(
+      blocked.reason.includes("no UI") || blocked.reason.includes("没有可确认"),
+      blocked.reason,
+    );
+  });
+});
+
 test("auto mode protected-path review asks with UI and blocks without UI", async () => {
   await withTemporaryHome(async (home) => {
     fs.writeFileSync(

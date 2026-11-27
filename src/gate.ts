@@ -3,13 +3,15 @@
  *
  * ToolGate owns the decision pipeline that was previously bash-only:
  *
- *   hard-block -> safe pass-through -> allow-list/model/user decision
+ *   safe pass-through -> allow-list/user decision -> model review
  *   -> remember -> delegate
  *
  * Concrete gates (bash, eval) supply the tool-specific hooks:
  * analyze() / buildKey() / delegate(), plus the schema and subject
  * extraction.  The flow itself never varies, so every covered tool gets
- * identical approval semantics.
+ * identical approval semantics.  There is no static veto: an operation that
+ * matches a critical behavior always asks the user (and blocks only when no
+ * UI can present the question).
  */
 
 import type {
@@ -124,7 +126,7 @@ export abstract class ToolGate {
     signal: AbortSignal | undefined,
     ctx: ExtensionCtx,
   ): Promise<GateAuthorization> {
-    const { logger, lang, t } = this.deps;
+    const { logger, lang } = this.deps;
     const subject = this.extractSubject(params);
     if (!subject.trim()) return { allowed: true };
 
@@ -135,25 +137,12 @@ export abstract class ToolGate {
     const label = analysis.labels[0]?.[lang] || analysis.labels[0]?.en || "danger";
     const subjectLabel = this.subjectDisplayLabel();
 
-    // Hard blocks precede every collaborator: no allow-list entry, model
-    // verdict, mode, or memory choice can override them.
-    if (analysis.hardBlocked) {
-      logger.log(`${this.toolName}: hard-blocked (${label})`);
-      return {
-        allowed: false,
-        result: {
-          content: [{
-            type: "text",
-            text: `Blocked: ${label}\n${t.decisionSourceHardBlock}\n${subjectLabel}: ${subject}`,
-          }],
-          details: { blocked: true, reason: label },
-          isError: true,
-        },
-      };
-    }
-
     // Safe operations stay zero-interruption: no model call, no dialog.
-    if (analysis.behaviors.length === 0 && !analysis.requiresConfirmation) {
+    if (
+      analysis.behaviors.length === 0 &&
+      !analysis.requiresConfirmation &&
+      !analysis.requiresUserApproval
+    ) {
       return { allowed: true };
     }
 
@@ -170,6 +159,7 @@ export abstract class ToolGate {
         memoryKey: memoryEligible ? this.buildKey(subject) : null,
         cwd: effectiveCwd,
         rememberScope: this.rememberScope,
+        requiresUserApproval: analysis.requiresUserApproval,
       },
       ctx,
       signal,

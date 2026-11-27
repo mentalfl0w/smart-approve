@@ -16,7 +16,7 @@ import type {
   ToolResultEvent,
 } from "./types";
 import { Logger } from "./logger";
-import { detectLang, getI18n, makeLabel } from "./i18n";
+import { detectLang, getI18n } from "./i18n";
 import type { Lang } from "./i18n";
 import { ProtectedPathMatcher, resolveFilesystemPathCandidates } from "./paths";
 import { ConfigStore } from "./config";
@@ -81,7 +81,7 @@ function collectProtectedTargets(event: ToolCallEvent): string[] {
   return [...targets];
 }
 
-function isHardBlockedFileTarget(target: string, cwd: string): boolean {
+function isSystemSensitiveFileTarget(target: string, cwd: string): boolean {
   return resolveFilesystemPathCandidates(target, cwd).some((candidate) =>
     /^(?:\/private)?\/etc\/(?:passwd|shadow|sudoers|hosts)(?:$|[./])/i.test(candidate) ||
     /^\/dev\/(?:sd[a-z]\d*|nvme\d+(?:n\d+)?(?:p\d+)?|disk\d+(?:s\d+)?|hd[a-z]\d*|vd[a-z]\d*|xvd[a-z]\d*|mmcblk\d+(?:p\d+)?|mapper\/[^/]+|md\d+|sg\d+|st\d+|nst\d+)$/i.test(candidate)
@@ -442,45 +442,46 @@ class SmartApprove {
     const targets = collectProtectedTargets(event).filter(
       (target) => !/^(?:proc|xd|agent|out):\/\//i.test(target),
     );
-    const hardBlockedPaths = targets.filter((target) => isHardBlockedFileTarget(target, cwd));
-    if (hardBlockedPaths.length > 0) {
-      const label = makeLabel(
-        "System-sensitive file or device writes are hard-blocked",
-        "系统敏感文件或设备写入已拦截",
-      );
-      return {
-        block: true,
-        reason: `Blocked: ${label[this.lang]}\n${this.t.decisionSourceHardBlock}\n${this.t.filePath}: ${hardBlockedPaths.join("\n")}`,
-      };
-    }
+    const systemSensitivePaths = targets.filter(
+      (target) => isSystemSensitiveFileTarget(target, cwd),
+    );
     const protectedPaths = targets.filter((target) => this.pathMatcher.isProtected(target, cwd));
-    if (protectedPaths.length === 0) return;
+    const candidates = [...new Set([...systemSensitivePaths, ...protectedPaths])];
+    if (candidates.length === 0) return;
 
     const needsReview = config.rememberDecisions
-      ? protectedPaths.filter((target) => !this.allowList.isAllowed(event.toolName, target, cwd))
-      : protectedPaths;
+      ? candidates.filter((target) => !this.allowList.isAllowed(event.toolName, target, cwd))
+      : candidates;
     if (needsReview.length === 0) return;
 
     const t = this.t;
     const targetLabel = needsReview.join("\n");
-    const title = t.confirmPathTitle(
-      needsReview.length === 1 ? needsReview[0] : t.fileCount(needsReview.length),
-    );
+    const systemReview = needsReview.filter((target) => systemSensitivePaths.includes(target));
+    const requiresUserApproval = systemReview.length > 0;
+    const title = requiresUserApproval
+      ? t.systemSensitivePathLabel
+      : t.confirmPathTitle(
+        needsReview.length === 1 ? needsReview[0] : t.fileCount(needsReview.length),
+      );
+    const behaviorLabels = requiresUserApproval
+      ? [t.systemSensitivePathBehavior, t.protectedPathBehavior]
+      : [t.protectedPathBehavior];
     const outcome = await this.approvalFlow.decide(
       {
         toolName: event.toolName,
-        label: t.protectedPathLabel,
+        label: requiresUserApproval ? t.systemSensitivePathLabel : t.protectedPathLabel,
         subjectLabel: t.filePath,
         promptSubject: formatProtectedReviewSubject(event, needsReview, t),
         promptSubjectLabel: t.filePath,
         displaySubject: targetLabel,
-        behaviorLabels: [t.protectedPathBehavior],
+        behaviorLabels,
         // Targets were already filtered through the allow-list above; the
         // flow must review exactly `needsReview`, and remember each target.
         memoryKey: null,
         cwd,
         rememberScope: "both",
         title,
+        requiresUserApproval,
         remember: (choice) => {
           for (const target of needsReview) {
             if (choice === "session") {

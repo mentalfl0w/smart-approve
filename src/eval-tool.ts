@@ -50,7 +50,7 @@ export class EvalToolGate extends ToolGate {
   protected readonly toolLabel = "Eval";
   protected readonly toolDescription =
     "Execute one Python or JavaScript cell in a persistent language runtime. " +
-    "Known high-risk launches and system-sensitive writes are hard-blocked; subprocesses, protected-path writes, and MCP/host-tool calls visible in the submitted cell require review. " +
+    "Known high-risk launches and system-sensitive writes always ask you to confirm; subprocesses, protected-path writes, and MCP/host-tool calls visible in the submitted cell require review. " +
     "Calls hidden in helpers defined by earlier cells are outside this review. " +
     `Capability marker: ${TASK_GROUP_PROC_CANCEL_MARKER}`;
   protected readonly rememberScope = "session" as const;
@@ -144,8 +144,8 @@ export class EvalToolGate extends ToolGate {
       (writeTargets.cwdDynamic || unresolvedCwd) &&
       analysis.behaviors.includes("eval-process-spawn");
     const behaviors = new Set(analysis.behaviors);
-    let hardBlocked = analysis.hardBlocked || sensitiveCwd;
-    let hardBlockedBySystemWrite = false;
+    let requiresUserApproval = analysis.requiresUserApproval || sensitiveCwd;
+    let requiresUserApprovalForSystemWrite = false;
     let requiresConfirmation = analysis.requiresConfirmation ?? false;
     let denyTier = analysis.denyTier;
     // Operations whose actual target depends on runtime cwd state, or whose
@@ -182,8 +182,8 @@ export class EvalToolGate extends ToolGate {
           /^\/dev\/(?:sd[a-z]\d*|nvme\d+(?:n\d+)?(?:p\d+)?|disk\d+(?:s\d+)?|hd[a-z]\d*|vd[a-z]\d*|xvd[a-z]\d*|mmcblk\d+(?:p\d+)?|mapper\/[^/]+|md\d+|sg\d+|st\d+|nst\d+)$/i.test(normalized)
         )
       ) {
-        hardBlocked = true;
-        hardBlockedBySystemWrite = true;
+        requiresUserApproval = true;
+        requiresUserApprovalForSystemWrite = true;
       } else if (
         this.deps.protectedPathMatcher?.isProtected(target, unresolvedCwd ? sessionCwd : cwd) ||
         candidates.some((candidate) =>
@@ -237,14 +237,14 @@ export class EvalToolGate extends ToolGate {
         "Eval 使用了无法静态确定的工作目录",
       ));
     }
-    if (hardBlockedBySystemWrite) {
+    if (requiresUserApprovalForSystemWrite) {
       labels.push(makeLabel("Eval writes a system-sensitive file", "Eval 代码写入系统敏感文件"));
     }
     return {
       ...analysis,
       behaviors: nextBehaviors,
       labels,
-      hardBlocked,
+      requiresUserApproval,
       denyTier,
       requiresConfirmation,
       memoryEligible,

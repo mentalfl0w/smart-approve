@@ -414,8 +414,9 @@ export class BashToolGate extends ToolGate {
   protected readonly toolLabel = "Bash";
   protected readonly toolDescription =
     "Executes a bash command. Risky commands (force-push, rm -rf, " +
-    "writes to system paths, etc.) are hard-blocked or routed through the " +
-    "configured review/auto policy. Safe commands execute with zero interruption.";
+    "writes to system paths, etc.) are routed through the configured " +
+    "review policy; the riskiest always require your confirmation. Safe " +
+    "commands execute with zero interruption.";
   protected readonly rememberScope = "both" as const;
   protected get strict(): boolean | undefined { return true; }
 
@@ -458,7 +459,7 @@ export class BashToolGate extends ToolGate {
       ? analyzeCommand(subject)
       : analyzeBashOperation(subject, cwd, sessionCwd);
 
-    let hardBlocked = analysis.hardBlocked;
+    let requiresUserApproval = analysis.requiresUserApproval;
     let denyTier = analysis.denyTier;
     let requiresConfirmation = analysis.requiresConfirmation ?? false;
     let memoryEligible = analysis.memoryEligible !== false;
@@ -473,7 +474,7 @@ export class BashToolGate extends ToolGate {
           labels.push(label);
         }
       }
-      if (extra.hardBlocked) hardBlocked = true;
+      if (extra.requiresUserApproval) requiresUserApproval = true;
       if (extra.denyTier) denyTier = true;
       if (extra.requiresConfirmation) requiresConfirmation = true;
       if (extra.memoryEligible === false) memoryEligible = false;
@@ -502,7 +503,7 @@ export class BashToolGate extends ToolGate {
       }
       const resolved = resolveCwdCandidate(path.resolve(currentCwd, target), currentCwd);
       // Check sensitivity before existence so a missing sensitive target still
-      // hard-blocks instead of downgrading to a generic confirmation.
+      // requires user approval instead of downgrading to a generic confirmation.
       merge(analyzeBashOperation("", resolved, sessionCwd));
       if (isUnresolvedCwd(resolved) || !isExistingDirectory(resolved)) {
         chainTrusted = false;
@@ -535,7 +536,7 @@ export class BashToolGate extends ToolGate {
       ...analysis,
       behaviors,
       labels,
-      hardBlocked,
+      requiresUserApproval,
       denyTier,
       requiresConfirmation,
       memoryEligible,
