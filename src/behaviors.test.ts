@@ -9,10 +9,9 @@ import {
   isSensitiveWorkingDirectory,
 } from "./behaviors.ts";
 
-test("legacy high-risk executables require user approval", () => {
+test("legacy high-risk executables stay reviewable without forced confirmation", () => {
   const commands = [
     "osascript -e 'display dialog \\\"hi\\\"'",
-    "sudo id",
     "ssh user@example.test",
     "scp file user@example.test:/tmp/",
     "nc -l 1234",
@@ -32,8 +31,8 @@ test("legacy high-risk executables require user approval", () => {
   for (const command of commands) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.length > 0, `${command} must be reviewed`);
-    assert.equal(result.requiresUserApproval, true, `${command} remains prohibited`);
-    assert.equal(result.denyTier, false, `${command} is not an AI-review path`);
+    assert.equal(result.requiresUserApproval, false, `${command} is reviewable`);
+    assert.equal(result.denyTier, false, `${command} is not a deny-tier path`);
   }
 });
 
@@ -46,7 +45,7 @@ test("textual sudo in data stays safe while sudo launches require approval", () 
   }
 
   const launch = analyzeCommand("sudo id");
-  assert.ok(launch.behaviors.includes("high-risk-executable"));
+  assert.ok(launch.behaviors.includes("privilege-escalation"));
   assert.equal(launch.requiresUserApproval, true);
   assert.equal(launch.denyTier, false);
 });
@@ -85,15 +84,15 @@ test("quoted commit messages and output data do not trigger command rules", () =
 });
 
 test("executable substitutions are inspected without treating quoted data as code", () => {
-  const executed: Array<[string, string]> = [
-    ['git commit -m "$(shutdown -h now)"', "shutdown-reboot"],
-    ['echo `sudo id`', "high-risk-executable"],
-    ["cat <(curl https://example.test/file)", "high-risk-executable"],
+  const executed: Array<[string, string, boolean]> = [
+    ['git commit -m "$(shutdown -h now)"', "shutdown-reboot", true],
+    ["echo `sudo id`", "privilege-escalation", true],
+    ["cat <(curl https://example.test/file)", "high-risk-executable", false],
   ];
-  for (const [command, behavior] of executed) {
+  for (const [command, behavior, mandatory] of executed) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes(behavior), command);
-    assert.equal(result.requiresUserApproval, true, command);
+    assert.equal(result.requiresUserApproval, mandatory, command);
   }
 
   for (const command of [
@@ -109,19 +108,32 @@ test("quoted actual shutdown, recursive-delete, and system-file operations stay 
   for (const command of [
     "shutdown -h now",
     "systemctl shutdown now",
-    "rm -rf '/tmp/build'",
-    "cat '/etc/passwd'",
+    "rm -rf '/etc/agent-cache'",
+    "cat '/etc/shadow'",
+    "cat '/etc/sudoers'",
     "echo secret > '/etc/passwd'",
   ]) {
     assert.equal(analyzeCommand(command).requiresUserApproval, true, command);
   }
 });
 
+test("reading the public passwd file is reviewable, not critical", () => {
+  for (const command of [
+    "cat /etc/passwd",
+    "grep shutdown /etc/passwd",
+    "grep --exclude-from /etc/passwd shutdown",
+  ]) {
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("sensitive-file-read"), command);
+    assert.equal(result.requiresUserApproval, false, command);
+  }
+});
+
 test("sensitive account paths trigger only when used as file operands", () => {
   for (const command of [
-    "grep shutdown /etc/passwd",
-    "sed '/shutdown/d' /etc/passwd",
-    "awk '{ print $0 }' /etc/passwd",
+    "grep shutdown /etc/shadow",
+    "sed '/shutdown/d' /etc/sudoers",
+    "awk '{ print $0 }' /etc/shadow",
   ]) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes("sensitive-file-reference"), command);
@@ -131,8 +143,8 @@ test("sensitive account paths trigger only when used as file operands", () => {
 
 test("sensitive files passed as search option files remain protected", () => {
   for (const command of [
-    "grep --exclude-from /etc/passwd shutdown",
-    "grep -f /etc/passwd shutdown",
+    "grep --exclude-from /etc/shadow shutdown",
+    "grep -f /etc/sudoers shutdown",
   ]) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes("sensitive-file-reference"), command);
@@ -150,7 +162,7 @@ test("legacy interpreter execution flags require approval without matching ordin
   ]) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes("interpreter-inline-execution"), command);
-    assert.equal(result.requiresUserApproval, true, command);
+    assert.equal(result.requiresUserApproval, false, command);
   }
 
   for (const command of ["bun run dev", "python3 manage.py runserver", "node server.js", "ls -la"]) {
@@ -162,16 +174,20 @@ test("legacy interpreter execution flags require approval without matching ordin
 
 test("migrated dangerous arguments require user approval", () => {
   for (const command of [
-    "env rm -Rf /tmp/x",
-    "env rm -r -f /tmp/x",
+    "env rm -Rf /opt/x",
+    "env rm -r -f /opt/x",
     "chmod -R 777 /etc/foo",
     "chown root:root /etc/passwd",
-    "dd if=/dev/zero of=disk.img",
+    "dd if=/dev/zero of=/dev/sda",
   ]) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.length > 0, command);
     assert.equal(result.requiresUserApproval, true, command);
   }
+
+  const reviewable = analyzeCommand("dd if=/dev/zero of=disk.img");
+  assert.ok(reviewable.behaviors.includes("auto-approve-denied"));
+  assert.equal(reviewable.requiresUserApproval, false);
 
   for (const command of [
     "env mkfs.ext4 /dev/sdb1",
@@ -185,9 +201,173 @@ test("migrated dangerous arguments require user approval", () => {
   ]) {
     assert.equal(analyzeCommand(command).requiresUserApproval, true, command);
   }
+});
+test("permission changes and dd writes resolve sensitive paths before classification", () => {
+  const cases: Array<[string, string, string]> = [
+    ["chmod -R 777 /", process.cwd(), "permission-change-system"],
+    ["chmod -R 777 /System/Library", process.cwd(), "permission-change-system"],
+    ["chmod -R 777 /Applications", process.cwd(), "permission-change-system"],
+    ["chmod -R 777 /Users", process.cwd(), "permission-change-system"],
+    ["chmod -R 777 /Users/another-user", process.cwd(), "permission-change-system"],
+    ["chmod -R 777 /private", process.cwd(), "permission-change-system"],
+    ["chown -R root:wheel /private/etc", process.cwd(), "permission-change-system"],
+    ["chmod -R 777 /tmp/../etc/passwd", process.cwd(), "permission-change-system"],
+    ["chown root:wheel //etc/passwd", process.cwd(), "permission-change-system"],
+    ["chown root:wheel ../../../etc/passwd", "/work/project/subdir", "permission-change-system"],
+    ["cd \"$DIR\" && chmod 777 ../etc/passwd", "/work/project", "permission-change-system"],
+    ["dd if=/dev/zero of=/", process.cwd(), "dd-write"],
+    ["dd if=/dev/zero of=/private/etc/hosts", process.cwd(), "dd-write"],
+    ["dd if=/dev/zero of=../../../etc/shadow", "/work/project/subdir", "dd-write"],
+    ["cd \"$DIR\" && dd if=/dev/zero of=../../etc/passwd", "/work/project", "dd-write"],
+  ];
 
-  assert.equal(analyzeCommand("rm -rf /tmp/build").requiresUserApproval, true);
-  assert.equal(analyzeCommand("rm -rf /").requiresUserApproval, true);
+  for (const [command, cwd, behavior] of cases) {
+    const result = analyzeCommand(command, cwd);
+    assert.ok(result.behaviors.includes(behavior), command);
+    assert.equal(result.requiresUserApproval, true, command);
+  }
+});
+
+test("recursive delete is unflagged only inside temporary subdirectories", () => {
+  for (const command of [
+    "rm -rf /tmp/build",
+    "rm -rf /tmp/a/b",
+    "rm -rf '/private/tmp/x'",
+    "rm -rf /tmp/./a",
+  ]) {
+    assert.deepEqual(analyzeCommand(command).behaviors, [], command);
+  }
+  assert.deepEqual(analyzeCommand("rm -rf ./build", "/tmp/work").behaviors, []);
+  assert.deepEqual(analyzeCommand("rm -rf child", "/tmp").behaviors, []);
+  for (const command of [
+    "cd /tmp && rm -rf build",
+    "cd /tmp; rm -rf build",
+    "cd /tmp && cd sub && rm -rf x",
+    "cd /private/tmp/work && rm -rf child",
+  ]) {
+    assert.deepEqual(analyzeCommand(command, "/work/project").behaviors, [], command);
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-rm-"));
+  try {
+    const link = path.join(dir, "escape");
+    fs.symlinkSync("/etc", link);
+    for (const command of [
+      "rm -rf /tmp",
+      "rm -rf /tmp/",
+      "rm -rf /tmp/*",
+      "rm -rf /tmp/$USER",
+      "rm -rf /tmp/../etc",
+      "rm -rf /tmp/build /etc/passwd",
+      "rm -rf /tmpfoo",
+      "rm -rf /opt/build",
+      "cd /tmp && rm -rf ../etc",
+      "cd /tmp || rm -rf build",
+      "cd /tmp | rm -rf build",
+      "cd /tmp & rm -rf build",
+      "cd /tmp && rm -rf *",
+      `cd "$DIR" && rm -rf build`,
+      "rm -rf /opt/other",
+      `rm -rf ${link}`,
+    ]) {
+      assert.ok(analyzeCommand(command).behaviors.includes("recursive-force-delete"), command);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recursive delete inside the project root is reviewable, not forced", () => {
+  for (const command of [
+    "rm -rf build",
+    "rm -rf build && cd /tmp",
+    "cd sub && rm -rf child",
+    "rm -rf /work/project/dist",
+  ]) {
+    const result = analyzeCommand(command, "/work/project");
+    assert.ok(result.behaviors.includes("recursive-force-delete-workspace"), command);
+    assert.equal(result.requiresUserApproval, false, command);
+  }
+
+  for (const command of ["rm -rf .", "rm -rf ..", "rm -rf *"]) {
+    const result = analyzeCommand(command, "/work/project");
+    assert.ok(result.behaviors.includes("recursive-force-delete"), command);
+    assert.equal(result.requiresUserApproval, true, command);
+  }
+});
+test("workspace deletion exemption rejects broad and protected session roots", () => {
+  const home = process.env.HOME || os.homedir();
+  for (const sessionRoot of [
+    path.sep,
+    home,
+    path.dirname(home),
+    "/home",
+    "/Users",
+    "/etc",
+    "/usr",
+    "/private",
+  ]) {
+    const result = analyzeCommand("rm -rf child", sessionRoot, sessionRoot);
+    assert.ok(result.behaviors.includes("recursive-force-delete"), sessionRoot);
+    assert.equal(result.requiresUserApproval, true, sessionRoot);
+    assert.ok(!result.behaviors.includes("recursive-force-delete-workspace"), sessionRoot);
+  }
+
+  const workspace = path.join(home, "smart-approve-workspace");
+  const reviewable = analyzeCommand("rm -rf child", workspace, workspace);
+  assert.ok(reviewable.behaviors.includes("recursive-force-delete-workspace"));
+  assert.equal(reviewable.requiresUserApproval, false);
+});
+
+test("temporary delete exemptions are disabled for links and bind mounts, including nested commands", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-alias-"));
+  try {
+    const link = path.join(directory, "link");
+    const mountPoint = path.join(directory, "mount");
+    fs.mkdirSync(mountPoint);
+    for (const command of [
+      `ln -s /etc ${link} && rm -rf ${link}/passwd`,
+      `mount --bind /etc ${mountPoint} && rm -rf ${mountPoint}/passwd`,
+      `mount -o bind /etc ${mountPoint} && rm -rf ${mountPoint}/passwd`,
+      `mount -B /etc ${mountPoint} && rm -rf ${mountPoint}/passwd`,
+      `mount -R /etc ${mountPoint} && rm -rf ${mountPoint}/passwd`,
+      `bash -c 'ln -s /etc ${link}' && rm -rf ${link}/passwd`,
+      `echo $(ln -s /etc ${link}) && rm -rf ${link}/passwd`,
+      `eval 'ln -s /etc ${link}' && rm -rf ${link}/passwd`,
+      `find . -exec ln -s /etc ${link} \\; && rm -rf ${link}/passwd`,
+    ]) {
+      const result = analyzeCommand(command, "/work/project", "/work/project");
+      assert.ok(result.behaviors.includes("recursive-force-delete"), command);
+      assert.equal(result.requiresUserApproval, true, command);
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("home-root deletion is exact, not any descendant", () => {
+  const home = os.homedir();
+  for (const command of [
+    `rm -rf ${path.join(home, "Downloads/x")}`,
+    `rm -rf ${path.join(home, "project/dist")}`,
+    "rm -rf ~/Downloads/x",
+  ]) {
+    const result = analyzeCommand(command, path.join(home, "project"));
+    assert.ok(!result.behaviors.includes("delete-home"), command);
+  }
+
+  for (const command of [
+    "rm -rf ~",
+    "rm -rf ~/",
+    "rm -rf ~/*",
+    "rm -rf $HOME",
+    `rm -rf ${home}`,
+  ]) {
+    assert.ok(
+      analyzeCommand(command, path.join(home, "project")).behaviors.includes("delete-home"),
+      command,
+    );
+  }
 });
 
 test("sensitive working directories require approval only outside the session root", () => {
@@ -320,7 +500,6 @@ test("local branch deletes need review, including plain -d", () => {
 
 test("non-deleting branch commands stay unflagged", () => {
   for (const command of [
-    "git branch -m old new",
     "git branch -c old new",
     "git branch -u origin/main",
     "git branch --set-upstream-to=origin/main feature",
@@ -329,6 +508,10 @@ test("non-deleting branch commands stay unflagged", () => {
   ]) {
     assert.deepEqual(analyzeCommand(command).behaviors, [], command);
   }
+  // VS Code's default table denies branch renames; reviewable, not critical.
+  const rename = analyzeCommand("git branch -m old new");
+  assert.deepEqual(rename.behaviors, ["auto-approve-denied"]);
+  assert.equal(rename.requiresUserApproval, false);
 });
 
 test("forced branch deletes keep review; remote-tracking deletes get their own label", () => {
@@ -379,7 +562,7 @@ test("forced branch deletes keep review; remote-tracking deletes get their own l
 
 test("rmdir keeps the root review without flagging ordinary paths", () => {
   const root = analyzeCommand("rmdir /");
-  assert.deepEqual(root.behaviors, ["recursive-force-delete"]);
+  assert.ok(root.behaviors.includes("recursive-force-delete"));
   assert.equal(root.requiresUserApproval, true);
 
   for (const command of [
@@ -396,56 +579,96 @@ test("rmdir keeps the root review without flagging ordinary paths", () => {
   }
 });
 test("xargs and find execution clauses retain nested command checks", () => {
-  const blocked: Array<[string, string]> = [
-    ["echo now | xargs shutdown", "shutdown-reboot"],
-    ["echo x | xargs rm -rf /tmp/y", "recursive-force-delete"],
-    ["echo x | xargs -n 1 bash -c 'echo ok'", "interpreter-inline-execution"],
-    ["find . -name '*.log' -exec rm -rf {} +", "recursive-force-delete"],
+  const cases: Array<[string, string, boolean]> = [
+    ["echo now | xargs shutdown", "shutdown-reboot", true],
+    ["echo x | xargs rm -rf /opt/y", "recursive-force-delete", true],
+    ["echo x | xargs -n 1 bash -c 'echo ok'", "interpreter-inline-execution", false],
+    ["find . -name '*.log' -exec rm -rf {} +", "recursive-force-delete", true],
   ];
-  for (const [command, behavior] of blocked) {
+  for (const [command, behavior, mandatory] of cases) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes(behavior), command);
+    assert.equal(result.requiresUserApproval, mandatory, command);
+  }
+
+  assert.deepEqual(analyzeCommand("find . -exec echo shutdown \\;").behaviors, [
+    "auto-approve-denied",
+  ]);
+});
+test("nested command analysis carries known segment cwd and fails closed when unknown", () => {
+  for (const command of [
+    "cd .. && bash -c 'rm -rf sibling'",
+    "cd .. && eval 'rm -rf sibling'",
+    "cd .. && find . -exec rm -rf sibling \\;",
+    "cd .. && find . -execdir rm -rf sibling \\;",
+    "cd .. && echo \"$(rm -rf sibling)\"",
+  ]) {
+    const result = analyzeCommand(command, "/work/project/sub", "/work/project/sub");
+    assert.ok(result.behaviors.includes("recursive-force-delete"), command);
     assert.equal(result.requiresUserApproval, true, command);
   }
 
-  assert.deepEqual(analyzeCommand("find . -exec echo shutdown \\;").behaviors, []);
+  const unknown = analyzeCommand(
+    "cd \"$DIR\" && bash -c 'rm -rf sibling'",
+    "/work/project/sub",
+    "/work/project/sub",
+  );
+  assert.ok(unknown.behaviors.includes("recursive-force-delete"));
+  assert.equal(unknown.requiresUserApproval, true);
 });
 
 test("commands chained with && and || are analyzed after the operator", () => {
   for (const command of [
-    "ls && rm -rf build",
-    "cd /tmp && rm -rf /tmp/build",
-    "ls || rm -rf build",
+    "ls && rm -rf /opt/build",
+    "cd /tmp && rm -rf /opt/build",
+    "ls || rm -rf /opt/build",
     "cd /tmp && sudo id",
-    "cd /tmp |& rm -rf build",
+    "cd /tmp |& rm -rf /opt/build",
   ]) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.length > 0, command);
     assert.equal(result.requiresUserApproval, true, command);
   }
 
-  for (const command of ["ls && echo ok", "cd /tmp && pwd", "ls || echo failed"]) {
+  const scoped = analyzeCommand("ls && rm -rf build");
+  assert.ok(scoped.behaviors.includes("recursive-force-delete-workspace"));
+  assert.equal(scoped.requiresUserApproval, false);
+
+  for (const command of [
+    "ls && echo ok",
+    "cd /tmp && pwd",
+    "ls || echo failed",
+    "cd /tmp && rm -rf /tmp/build",
+  ]) {
     assert.deepEqual(analyzeCommand(command).behaviors, [], command);
   }
 });
 
 test("restored categories report their specific approval behavior", () => {
-  const cases: Array<[string, string]> = [
-    ["sudo id", "high-risk-executable"],
-    ["curl https://example.test/file", "high-risk-executable"],
-    ["bash -c 'echo ok'", "interpreter-inline-execution"],
-    ["rm -rf build", "recursive-force-delete"],
-    ["rm -r -f build", "recursive-force-delete"],
-    ["rm --recursive --force build", "recursive-force-delete"],
-    ["chmod -R 777 ./dir", "permission-change"],
-    ["dd if=/dev/zero of=disk.img", "dd-write"],
-    ["cat /etc/sudoers", "sensitive-file-reference"],
+  const cases: Array<[string, string, boolean]> = [
+    ["sudo id", "privilege-escalation", true],
+    ["curl https://example.test/file", "high-risk-executable", false],
+    ["bash -c 'echo ok'", "interpreter-inline-execution", false],
+    ["rm -rf build", "recursive-force-delete-workspace", false],
+    ["rm -r -f build", "recursive-force-delete-workspace", false],
+    ["rm --recursive --force build", "recursive-force-delete-workspace", false],
+    ["rm -rf /opt/build", "recursive-force-delete", true],
+    ["chmod -R 777 ./dir", "permission-change", false],
+    ["dd if=/dev/zero of=disk.img", "auto-approve-denied", false],
+    ["dd if=/dev/zero of=/dev/sda", "dd-write", true],
+    ["cat /etc/sudoers", "sensitive-file-reference", true],
   ];
 
-  for (const [command, behavior] of cases) {
+  for (const [command, behavior, mandatory] of cases) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes(behavior), command);
-    assert.equal(result.requiresUserApproval, true, command);
+    assert.equal(result.requiresUserApproval, mandatory, command);
     assert.equal(result.denyTier, false, command);
   }
+});
+test("analysis budget exhaustion requires mandatory review", () => {
+  const substitutions = Array.from({ length: 65 }, () => "$(echo ok)").join(" ");
+  const result = analyzeCommand(`echo ${substitutions}`);
+  assert.ok(result.behaviors.includes("analysis-limit-exceeded"));
+  assert.equal(result.requiresUserApproval, true);
 });

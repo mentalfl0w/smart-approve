@@ -144,7 +144,7 @@ test("extracts literal os.exec/os.spawn/posix_spawn executable heads", () => {
   ]) {
     const result = analyzer.analyze(code);
     assert.ok(result.behaviors.includes(RISK), code);
-    assert.equal(result.requiresUserApproval, true, code);
+    assert.equal(result.requiresUserApproval, false, code);
   }
 });
 
@@ -205,22 +205,27 @@ test("requires approval for rm -rf / and rm -rf $HOME", () => {
 });
 
 test("requires approval for legacy high-risk process targets when spawn intent is present", () => {
-  for (const code of [
-    'subprocess.run(["ssh", "host"])',
-    'os.system("curl https://example.test/file")',
-    'subprocess.run("bash -c \\"echo ok\\"")',
-    'Bun.spawn(["bash", "-c", "echo ok"])',
-    'Bun.spawn(["sudo", "id"])',
-    'subprocess.run("chmod +x script.sh")',
-    'subprocess.run("dd if=/dev/zero of=disk.img")',
-    'Bun.$`expect -c "spawn id"`',
-  ]) {
+  const cases: Array<[string, boolean]> = [
+    ['subprocess.run(["ssh", "host"])', false],
+    ['os.system("curl https://example.test/file")', false],
+    ['subprocess.run("bash -c \\"echo ok\\"")', false],
+    ['Bun.spawn(["bash", "-c", "echo ok"])', false],
+    ['Bun.spawn(["sudo", "id"])', true],
+    ['subprocess.run("chmod +x script.sh")', false],
+    ['subprocess.run("dd if=/dev/zero of=disk.img")', false],
+    ['Bun.$`expect -c "spawn id"`', false],
+  ];
+  for (const [code, mandatory] of cases) {
     const result = analyzer.analyze(code);
     assert.ok(result.behaviors.includes(SPAWN), code);
     assert.ok(result.behaviors.includes(RISK), code);
-    assert.equal(result.requiresUserApproval, true, code);
+    assert.equal(result.requiresUserApproval, mandatory, code);
     assert.equal(result.denyTier, false, code);
   }
+
+  const ddDevice = analyzer.analyze('subprocess.run("dd if=/dev/zero of=/dev/sda")');
+  assert.ok(ddDevice.behaviors.includes(PAYLOAD));
+  assert.equal(ddDevice.requiresUserApproval, true);
 });
 
 test("reuses Bash wrapper and quoting parsing for Eval spawn heads", () => {
@@ -232,7 +237,7 @@ test("reuses Bash wrapper and quoting parsing for Eval spawn heads", () => {
   ]) {
     const result = analyzer.analyze(code);
     assert.ok(result.behaviors.includes(RISK), code);
-    assert.equal(result.requiresUserApproval, true, code);
+    assert.equal(result.requiresUserApproval, false, code);
   }
 });
 
@@ -253,7 +258,6 @@ test("safe executables with high-risk-looking arguments stay reviewable", () => 
 
 test("requires approval for account-file references in spawned arguments", () => {
   for (const code of [
-    "Bun.$`cat /etc/passwd`",
     'subprocess.run("cat /etc/shadow")',
     'Bun.spawn(["cat", "/etc/sudoers"])',
   ]) {
@@ -262,9 +266,24 @@ test("requires approval for account-file references in spawned arguments", () =>
     assert.equal(result.requiresUserApproval, true, code);
     assert.equal(result.denyTier, false, code);
   }
+
+  const passwd = analyzer.analyze("Bun.$`cat /etc/passwd`");
+  assert.deepEqual(passwd.behaviors, [SPAWN]);
+  assert.equal(passwd.requiresUserApproval, false);
 });
 
-test("recursive force deletion in spawned commands requires approval regardless of target", () => {
+test("recursive force deletion in spawned commands requires approval outside temp dirs", () => {
+  for (const code of [
+    "Bun.$`rm -rf /opt/build`;",
+    "Bun.$`rm -fr /Users/example/data`;",
+    'Bun.spawn(["rm", "-rf", "/opt/dist"])',
+  ]) {
+    const result = analyzer.analyze(code);
+    assert.deepEqual(result.behaviors, [SPAWN, RISK], code);
+    assert.equal(result.requiresUserApproval, true, code);
+    assert.equal(result.denyTier, false, code);
+  }
+
   for (const code of [
     "Bun.$`rm -rf ./node_modules`;",
     "Bun.$`rm -fr ./build`;",
@@ -274,9 +293,19 @@ test("recursive force deletion in spawned commands requires approval regardless 
     'Bun.spawn(["rm", "-rf", "./dist"])',
   ]) {
     const result = analyzer.analyze(code);
-    assert.deepEqual(result.behaviors, [SPAWN, RISK], code);
-    assert.equal(result.requiresUserApproval, true, code);
+    assert.deepEqual(result.behaviors, [SPAWN], code);
+    assert.equal(result.requiresUserApproval, false, code);
     assert.equal(result.denyTier, false, code);
+  }
+
+  for (const code of [
+    "Bun.$`rm -rf /tmp/build`;",
+    "Bun.$`rm -fr /tmp/build/sub`;",
+    'Bun.spawn(["rm", "-rf", "/tmp/build"])',
+  ]) {
+    const result = analyzer.analyze(code);
+    assert.deepEqual(result.behaviors, [SPAWN], code);
+    assert.equal(result.requiresUserApproval, false, code);
   }
 });
 
@@ -352,12 +381,14 @@ test("recognizes symlinked sensitive home directories for Eval cwd", () => {
 test("Python shell escapes and %%bash count as spawn intent with legacy checks", () => {
   for (const [code, hard] of [
     ["!ls -la", false],
-    ["var = !cat /etc/passwd", true],
-    ["!rm -rf ./build", true],
+    ["var = !cat /etc/passwd", false],
+    ["var = !cat /etc/shadow", true],
+    ["!rm -rf ./build", false],
+    ["!rm -rf /opt/build", true],
     ["%%bash\necho ssh", false],
-    ["%%bash\nssh host", true],
-    ["%%bash\ncd /tmp\nssh host", true],
-    ["!echo ssh && ssh host", true],
+    ["%%bash\nssh host", false],
+    ["%%bash\ncd /tmp\nssh host", false],
+    ["!echo ssh && ssh host", false],
   ] as const) {
     const result = analyzer.analyze(code, "py", "/work/project", "/work/project");
     assert.ok(result.behaviors.includes(SPAWN), code);
@@ -366,15 +397,15 @@ test("Python shell escapes and %%bash count as spawn intent with legacy checks",
 });
 
 test("folds backslash-continued Python shell magics before payload checks", () => {
-  for (const code of [
-    "!rm \\\n-rf /",
-    "!rm \\\n-rf ./build",
-    "x = !rm \\\n-rf ./build",
-    "%%bash\nrm \\\n-rf ./build",
-    "%%bash\ncd \\\n/etc\ntouch marker",
-  ]) {
+  for (const [code, hard] of [
+    ["!rm \\\n-rf /", true],
+    ["!rm \\\n-rf ./build", false],
+    ["x = !rm \\\n-rf ./build", false],
+    ["%%bash\nrm \\\n-rf ./build", false],
+    ["%%bash\ncd \\\n/etc\ntouch marker", true],
+  ] as const) {
     const result = analyzer.analyze(code, "py", "/work/project", "/work/project");
-    assert.equal(result.requiresUserApproval, true, code);
+    assert.equal(result.requiresUserApproval, hard, code);
   }
 });
 

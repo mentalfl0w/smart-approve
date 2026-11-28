@@ -346,14 +346,20 @@ test("bash: critical behaviors ask the user even in auto mode", async () => {
   assert.match(h.selectTitle ?? "", /Recursive force delete/);
   assert.match(h.calls.selectBodies[0], /always requires your decision/);
 
-  // A temporary-directory target is not exempt: the user still decides.
+  // Recursive deletes confined to temporary subdirectories are safe.
   const temp = makeHarness({ mode: "auto" });
-  temp.selectResult = "Allow for this session";
   const tempResult = await run(BashToolGate, temp, { command: "rm -rf /tmp/build" });
   assert.equal(tempResult.content[0].text, "native-run");
-  assert.equal(temp.calls.analyze, 1);
+  assert.equal(temp.calls.analyze, 0);
   assert.equal(temp.calls.delegate, 1);
-  assert.match(temp.selectTitle ?? "", /Recursive force delete/);
+  assert.equal(temp.selectChoices, null);
+
+  const tempCd = makeHarness({ mode: "auto" });
+  const tempCdResult = await run(BashToolGate, tempCd, { command: "cd /tmp && rm -rf build" });
+  assert.equal(tempCdResult.content[0].text, "native-run");
+  assert.equal(tempCd.calls.analyze, 0);
+  assert.equal(tempCd.calls.delegate, 1);
+  assert.equal(tempCd.selectChoices, null);
 
   // A model veto is advisory too: the user can still allow, and a deny
   // verdict never turns into an automatic block.
@@ -362,7 +368,7 @@ test("bash: critical behaviors ask the user even in auto mode", async () => {
     { analyzeResult: { risk: "high", recommend: "deny" } },
   );
   veto.selectResult = "Allow for this session";
-  const vetoResult = await run(BashToolGate, veto, { command: "rm -rf /tmp/build" });
+  const vetoResult = await run(BashToolGate, veto, { command: "rm -rf /opt/build" });
   assert.equal(vetoResult.content[0].text, "native-run");
   assert.equal(veto.calls.analyze, 1);
   assert.equal(veto.calls.delegate, 1);
@@ -1081,7 +1087,7 @@ test("eval gates Python shell magics and writefile targets", async () => {
   assert.equal(reviewedShell.content[0].text, "native-run");
   assert.equal(shell.calls.analyze, 1);
   assert.equal(shell.calls.delegate, 1);
-  assert.match(shell.calls.selectBodies[0], /always requires your decision/);
+  assert.match(shell.calls.selectBodies[0], /Spawns a subprocess or invokes system commands/);
 
   const protectedWrite = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
   const allowedWrite = await run(EvalToolGate, protectedWrite, {
