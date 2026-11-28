@@ -456,7 +456,9 @@ export class BashToolGate extends ToolGate {
     const sessionCwd = sessionCandidates[sessionCandidates.length - 1] ?? sessionBase;
 
     const analysis = leadingUnresolved
-      ? analyzeCommand(subject)
+      // An unresolved cwd cannot vouch for relative targets; only absolute
+      // temporary paths may be exempt from the recursive-delete check.
+      ? analyzeCommand(subject, path.parse(process.cwd()).root, "")
       : analyzeBashOperation(subject, cwd, sessionCwd);
 
     let requiresUserApproval = analysis.requiresUserApproval;

@@ -24,11 +24,10 @@ LLM calls bash / eval / write / edit / …
        │
    ToolGate / protected-path review — shared approval flow
        ├─ nothing flagged for review → execute (zero interruption)
-       ├─ critical behavior (high-risk launch such as curl/ssh/sudo,
-       │  interpreter -c/-e, rm -rf, sensitive working dirs, fork bomb,
-       │  curl|sh, system file/device writes, eval subprocess + destructive
-       │  payload…) → you decide; the model analysis is advisory, and no
-       │  UI means a block
+       ├─ critical behavior (recursive delete outside project/temp, privilege
+       │  escalation, sensitive working dirs, fork bomb, curl|sh, system
+       │  file/device writes, eval subprocess + destructive payload…)
+       │  → you decide; the model analysis is advisory, and no UI means a block
        └─ other flagged operation
               ├─ remembered session/permanent decision → execute
               ├─ no UI? interactive → block; auto without autoInHeadless → block
@@ -54,7 +53,7 @@ Two approval modes:
 | `interactive` (default) | Model analysis is shown in a dialog; you choose session-allow / permanent-allow / deny. A missing verdict is shown in the dialog; the decision still belongs to you |
 | `auto` | A valid model verdict decides ordinary flagged operations. Critical operations always ask you even in auto mode; a remembered decision still applies. Without a valid verdict, a UI session asks you and a headless session blocks |
 
-Configured protected-path writes go through the same flow: model analysis first, then the interactive dialog or a valid auto verdict. Matching a protected path is not by itself a mandatory human prompt. Recognized high-risk process launches, recursive force deletes, sensitive working directories, writes to system-sensitive files/devices, and system account-file references in Bash commands or spawned Eval arguments always require your confirmation in every mode.
+Configured protected-path writes go through the same flow: model analysis first, then the interactive dialog or a valid auto verdict. Matching a protected path is not by itself a mandatory human prompt. Recursive deletes outside the session root and outside temp/cache directories, privilege escalation, sensitive working directories, writes to system-sensitive files/devices, system-path permission changes, and `/etc/shadow`/`/etc/sudoers` references in Bash commands or spawned Eval arguments always require your confirmation in every mode. Recursive deletes inside the project, `/etc/passwd` reads, high-risk executables (`curl`, `ssh`, …), interpreter inline code, and ordinary `chmod`/`chown` are reviewable: the model verdict applies in auto mode, and interactive mode still asks.
 
 Headless/subagent sessions have no human to ask. Interactive mode blocks reviewable operations. Auto mode uses valid model verdicts for ordinary flagged operations only when `autoInHeadless` is enabled; with no valid verdict — or when `autoInHeadless` is disabled — the operation is blocked. Critical operations always block in a headless session, because no one can confirm them.
 
@@ -146,7 +145,7 @@ Static analysis decides what evidence to hand the model. When a target cannot be
 - **Python**: `subprocess` (including `run`, `Popen`, `check_call`, and `check_output`), `asyncio.create_subprocess_*`, `os.system`/`os.popen`, `os.exec*`/`os.spawn*`, `os.fork`/`os.forkpty`, `os.posix_spawn*`, and `multiprocessing.Process` (including bare `Process` when multiprocessing is imported)
 - Literal executable arguments to `os.exec*`/`os.spawn*`/`os.posix_spawn*` are parsed for launch-head and interpreter-flag checks; computed executable targets remain a static-analysis limit.
 - Launch-head and interpreter-flag classification reuses the Bash command analyzer, including wrapper/quoting semantics; dangerous-argument matching remains Eval's separate joined-argument rule set.
-- When code shows actual process-spawn intent, launch executables and interpreter inline flags are checked on the parsed command head, while dangerous arguments are checked across the joined argument stream: high-risk executables (`osascript`, `sudo`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`), interpreters with `-c`/`-e`/`-i`/`--eval`/`--command`, `rm -rf` variants, `chmod`/`chown`, `dd ... of=...`, and `/etc/passwd`/`/etc/shadow`/`/etc/sudoers` references require your confirmation. A safe executable with a high-risk-looking argument, such as `Bun.spawn(["echo", "ssh"])`, stays reviewable.
+- When code shows actual process-spawn intent, launch executables and interpreter inline flags are checked on the parsed command head, while dangerous arguments are checked across the joined argument stream: `sudo`/`doas` privilege escalation, `rm -rf` outside the project and temp/cache dirs, `chmod`/`chown` on system paths, `dd` to a device or system path, and `/etc/shadow`/`/etc/sudoers` references require your confirmation. High-risk executables (`ssh`, `curl`, …), interpreter inline flags, ordinary `chmod`/`chown`, project-scoped deletes, and `/etc/passwd` reads add reviewable behaviors instead.
 - Python cells: `!cmd` and `var = !cmd` shell escapes plus `%%bash` count as spawn intent; their literal shell text (with backslash continuations folded as the runner does) goes through the same launch-head, dangerous-argument, and destructive-payload checks. `%%writefile` targets enter Eval write-path checks and its body is treated as file content, not shell text. `%cd` targets enter cwd checks in source order with `chdir`.
 - `%run` and `%load` execute external file source that cannot be inspected statically; they are routed to model review instead of claiming static coverage, and no remembered decision is offered because the file can change.
 - Literal `process.chdir`/`os.chdir`/`Dir.chdir`/`%cd` targets are resolved against the effective base; a target inside a sensitive system directory requires your confirmation unless the session root contains it (the legacy outside-session exception). Lexical and canonical candidates cover symlinked `~/.ssh`/`~/.gnupg`. Computed chdir targets are not resolved; relative writes after a dynamic working directory require review, and such a cell does not offer a remembered decision.
@@ -157,12 +156,12 @@ Static analysis decides what evidence to hand the model. When a target cannot be
 
 ### 3. Process-launch behavior analysis
 
-The Bash analyzer marks these launch shapes as critical, so they always require your confirmation:
+The Bash analyzer classifies launch and flag shapes as follows:
 
-- high-risk executables (`osascript`, `sudo`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`);
-- interpreters used with `-c`, `-e`, `-i`, `--eval`, or `--command`, while ordinary script launches such as `python3 app.py` and `bun run dev` stay uninterrupted;
-- `chmod`/`chown`, `rm -rf` variants (including `rm -r -f` and long forms), `dd ... of=...`, and sensitive working directories outside the session root;
-- `mkfs`, shutdown/reboot, raw block-device writes, root deletion, fork bombs, remote fetch-and-execute, and `/etc/passwd`/`/etc/shadow`/`/etc/sudoers` references.
+- reviewable: high-risk executables (`osascript`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`), interpreters used with `-c`, `-e`, `-i`, `--eval`, or `--command`, ordinary `chmod`/`chown`, and every command matched by a VS Code auto-approve deny rule;
+- critical: `rm -rf` variants (including `rm -r -f` and long forms) outside the session root and temp/cache dirs, `dd` to a device or system path, `chmod`/`chown` on system paths, `sudo`/`doas`, sensitive working directories outside the session root, `mkfs`, shutdown/reboot, raw block-device writes, root deletion, fork bombs, remote fetch-and-execute, and `/etc/shadow`/`/etc/sudoers` references.
+
+VS Code's default terminal auto-approve table is ported in `src/auto-approve-rules.ts` (MIT, see `THIRD_PARTY_NOTICES.md`). Rule keys follow its syntax (plain prefix, path prefix, `/regex/flags`); deny rules win over allow rules, and every subcommand is evaluated separately. A deny match adds the reviewable `auto-approve-denied` behavior; it never overrides a critical behavior. Project-scoped deletes stay reviewable; temp/cache contents and ordinary `rmdir` stay zero-interruption.
 
 Force-push to a protected branch is reviewed by the model, distinct from these critical behaviors. Eval subprocess code (including Python `!` escapes and `%%bash`) receives static process-intent, sensitive-working-directory, and destructive-payload checks. Reviewable operations use the model: interactive mode shows the analysis and lets the user decide; auto mode applies a valid verdict to ordinary operations, always asks the user for critical ones, and blocks headless without a UI.
 
@@ -200,19 +199,18 @@ Remembered decisions are checked before model analysis and apply to every flagge
 
 These behaviors have no auto verdict and no static block: the model analysis is shown as advice, the dialog lets you choose session-allow / permanent-allow / deny, and a headless session blocks because nobody can confirm. Bash rules apply to command text; Eval launch/payload rules apply when process-spawn intent is detected.
 
-- High-risk executables (`osascript`, `sudo`, `ssh`, `scp`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`)
-- Interpreters invoked with inline-code flags (`-c`, `-e`, `-i`, `--eval`, `--command`)
-- Recursive force delete (`rm -rf` variants, including `rm -r -f` and long forms)
-- `chmod` / `chown` permission changes and `dd ... of=...` writes
+- Privilege escalation (`sudo`, `doas`)
+- Recursive force delete (`rm -rf` variants, including `rm -r -f` and long forms) when any target is outside the session root and outside temp/cache dirs. Literal paths strictly inside the session root are reviewable; literal paths strictly inside `/tmp`, `/var/tmp`, `/var/folders`, `~/.cache`, `~/Library/Caches`, and package-manager caches stay zero-interruption. The session root itself, temp roots, globs, variables, `..` escapes, and symlinks resolving outside remain critical
+- System-path `chmod` / `chown`, and `dd` to a device or system path
 - Sensitive working directories outside the session root (`/etc`, `/usr`, `/var`, `/bin`, `/sbin`, `/boot`, `/Library`, `/System`, `/private`, `~/.ssh`, `~/.gnupg`)
 - Delete root path (`rm -rf /`), delete home directory (`rm -rf ~`)
 - Fork bombs
 - Remote fetch-and-execute (`curl|sh`)
-- References to `/etc/passwd`, `/etc/shadow`, or `/etc/sudoers` (Bash always; Eval when process-spawn intent is detected), and writes to `/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `/etc/hosts` (Bash, Eval, and file tools)
+- References to `/etc/shadow` or `/etc/sudoers` (Bash always; Eval when process-spawn intent is detected), and writes to `/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `/etc/hosts` (Bash, Eval, and file tools)
 - Writes to raw block devices (`/dev/sd*`, `/dev/nvme*`, …) through Bash, Eval, and file tools
 - Disk format (`mkfs`, `dd` to block device)
 - Shutdown / reboot
-- eval: subprocess intent (including `!cmd` and `%%bash`) combined with any recognized high-risk launch target, dangerous argument, or destructive payload above
+- eval: subprocess intent (including `!cmd` and `%%bash`) combined with a destructive payload, dangerous argument, or any behavior that requires confirmation in Bash (`sudo`, `rm -rf` outside temp, `dd ... of=...`, system-path permission changes, sensitive account-file references). High-risk executables and interpreter inline code are reviewable in Eval too
 - eval: literal `chdir`/`%cd` or leading shell `cd` in `!cmd`/`%%bash` into a sensitive system directory; relative targets must also resolve outside the session root
 
 Protected-branch force-push is reviewed by the model, not a critical behavior.
@@ -237,7 +235,8 @@ The extension never executes shell commands or Eval cells itself. OMP's same-nam
 - Proc-service cwd is inferred from literal `cd`/`chdir` input after a successful `write proc://` result. OMP reports that input was sent, not whether a conditional or failing command changed cwd; indirect changes can desynchronize the inferred path. Unknown cwd is routed to review; without a valid verdict a UI session asks the user and a headless session blocks.
 - Eval code runs in a retained kernel, but the host resets the runner working directory to the session cwd before each cell, so a `chdir` does not carry into later cells. Literal `chdir`/`%cd` operations are resolved in source order for the critical-behavior check; computed targets are not resolved against the live runtime directory. A leading shell `cd` inside `!cmd`/`%%bash` is resolved against the effective base cwd. Same-cell dynamic `chdir` with relative writes remains review-worthy rather than statically classified. This is a gate on each submitted snippet, not live filesystem interception.
 - Python `%%writefile` targets are checked, but its body is file content, not shell code. A shell `cd` target that cannot be resolved before execution (for example, a symlink created earlier in the same input) requires review rather than an automatic decision.
-- Bash flags file operands for `/etc/passwd`, `/etc/shadow`, and `/etc/sudoers`, including reads. Grep/rg patterns, sed/awk programs, and Git messages/search terms count as data.
+- Bash flags file operands for `/etc/shadow` and `/etc/sudoers` as critical, and `/etc/passwd` as reviewable. Grep/rg patterns, sed/awk programs, and Git messages/search terms count as data.
+- `/tmp`, the other temporary roots, and regenerable user caches are exempt only for their contents: `rm -rf /tmp/build` is safe, `rm -rf /tmp` or `/tmp/*` is not. Relative targets are exempt only when the effective cwd is inside an exempt root and the resolved path stays there. Project-scoped deletes stay reviewable; glob and variable targets are never exempt because their expansion cannot be verified statically.
 - Eval requires your confirmation for those references only when code shows spawn intent. Other system files do not all share that rule.
 - OMP TUI `!`/`!!` shell commands (`user_bash`) and RPC `bash` are separate session-level execution paths, not registry `tool_call` invocations. Smart Approve covers model-facing Bash tool calls; these user-owned shell entrypoints are not gated by this extension.
 - OMP proc stdin protection covers only interactive shell/Python/JavaScript services started through Smart Approve in the same workspace. When `coverage.eval` is false, only shell input is gated. Other process types, services started before the extension, and detached services after a host restart are not tracked; their stdin passes through unchanged.

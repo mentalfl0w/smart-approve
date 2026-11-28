@@ -14,7 +14,7 @@
  */
 
 import type { DangerAnalysis } from "./types.ts";
-import { analyzeCommand, isSensitiveWorkingDirectory } from "./behaviors.ts";
+import { analyzeCommand, behaviorsRequireUserApproval, isSensitiveWorkingDirectory } from "./behaviors.ts";
 import { makeLabel } from "./i18n.ts";
 import { resolveFilesystemPathCandidates } from "./paths.ts";
 import * as fs from "node:fs";
@@ -1345,7 +1345,8 @@ const BARE_EXEC_FAMILY = /(?:^|[^\w$])(?:exec|spawn|fork)\s*\(/;
 // live inside the command strings/templates that spawn APIs receive.
 
 /** rm -rf on /, ~ or $HOME (recursive delete of root/home). */
-const RM_RF_ROOT = /(?:^|[^\w$])rm\s+-(?:rf|fr)\s+(?:\/|~|\$HOME\b|\$\{HOME\})/;
+const RM_RF_ROOT =
+  /(?:^|[^\w$])rm\s+-(?:rf|fr)\s+(?:\/(?=$|[\s;&|`"')])|~(?:\/|$|[\s;&|`"')])|\$HOME\b|\$\{HOME\})/;
 
 /** Classic fork bomb `:(){ :|:& };:` (also tolerant of spaces). */
 const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
@@ -1400,9 +1401,7 @@ function hasDangerousPayload(code: string): boolean {
 const DANGEROUS_ARGUMENT_PATTERNS: RegExp[] = [
   /\b(?:chmod|chown)\b/i,
   /\bdd\b[^;\n]{0,100}?\bof=/i,
-  /\brm\s+(?:-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\b/i,
-  /\brm\s+--(?:recursive\s+--force|force\s+--recursive)\b/i,
-  /\/etc\/(?:passwd|shadow|sudoers)\b/i,
+  /\/etc\/(?:shadow|sudoers)\b/i,
 ];
 
 function quotedArrayArgs(body: string): string[] {
@@ -1602,20 +1601,30 @@ export class EvalCodeBehaviorAnalyzer {
       ...extractSpawnCommandText(codeText, childProcessImport),
       ...(pythonScan?.commands ?? []),
     ].flatMap(splitShellSegments);
+    const launchAnalyses = hasProcessSpawn
+      ? launchCommands.map((command) => analyzeCommand(command, base, base))
+      : [];
     const riskyLaunch =
       hasProcessSpawn &&
       !dangerousPayload &&
-      launchCommands.some((command) => {
-        const behaviors = analyzeCommand(command).behaviors;
-        return (
-          behaviors.includes("high-risk-executable") ||
-          behaviors.includes("interpreter-inline-execution")
-        );
-      });
+      launchAnalyses.some((analysis) =>
+        analysis.behaviors.some(
+          (behavior) =>
+            behavior === "high-risk-executable" ||
+            behavior === "interpreter-inline-execution" ||
+            behavior === "privilege-escalation",
+        ),
+      );
+    const riskyRecursiveDelete =
+      hasProcessSpawn &&
+      launchAnalyses.some((analysis) =>
+        analysis.behaviors.includes("recursive-force-delete"),
+      );
     const riskyArguments =
       hasProcessSpawn &&
       !dangerousPayload &&
-      DANGEROUS_ARGUMENT_PATTERNS.some((pattern) => pattern.test(launchView));
+      (riskyRecursiveDelete ||
+        DANGEROUS_ARGUMENT_PATTERNS.some((pattern) => pattern.test(launchView)));
     if (riskyLaunch || riskyArguments) found.add("eval-risky-process");
 
     // Literal cwd operations are resolved in source order against the
@@ -1678,7 +1687,12 @@ export class EvalCodeBehaviorAnalyzer {
     if (pythonScan?.externalSource) found.add("eval-external-source");
 
     const requiresUserApproval =
-      dangerousPayload || riskyLaunch || riskyArguments || sensitiveCwd || shellSensitiveCwd;
+      dangerousPayload ||
+      sensitiveCwd ||
+      shellSensitiveCwd ||
+      launchAnalyses.some((analysis) =>
+        behaviorsRequireUserApproval(analysis.behaviors),
+      );
 
     const behaviors = [...found];
     const labels = behaviors.map((behavior) => BEHAVIORS[behavior] || makeLabel(behavior, behavior));
