@@ -91,8 +91,11 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
   "sensitive-file-reference": makeLabel("Access to protected system account files", "访问受保护的系统账号文件"),
   "sensitive-file-read": makeLabel("Reads a system account file", "读取系统账号文件"),
   "sensitive-working-directory": makeLabel("Runs outside the session in a sensitive directory", "在会话目录外的敏感目录运行"),
+  "analysis-limit-exceeded": makeLabel(
+    "Command analysis limit exceeded",
+    "命令分析超出限制",
+  ),
 };
-
 // Regexes over arbitrary arguments caused false positives in commit messages
 // and other data. Retain only this shell-grammar signature; command families
 // are matched from parsed executable names and arguments below.
@@ -165,9 +168,11 @@ interface ShellSegment {
   /** True when `||`, a pipe/background job, or a subshell boundary separates
    *  this segment from any earlier `cd`, so the cwd cannot be carried. */
   cwdUnsafe: boolean;
+  startOffset: number;
+  endOffset: number;
 }
 
-function splitShellCommands(command: string): ShellSegment[] {
+function splitShellCommands(command: string, substitutionStarts: number[] = []): ShellSegment[] {
   const result: ShellSegment[] = [];
   let start = 0;
   let quote: string | undefined;
@@ -177,8 +182,9 @@ function splitShellCommands(command: string): ShellSegment[] {
 
   const push = (end: number): void => {
     const segment = command.slice(start, end).trim();
-    if (!segment) return;
-    result.push({ segment, separator, cwdUnsafe });
+    const hasSubstitution = substitutionStarts.some((offset) => offset >= start && offset < end);
+    if (!segment && !hasSubstitution) return;
+    result.push({ segment, separator, cwdUnsafe, startOffset: start, endOffset: end });
     cwdUnsafe = false;
   };
 
@@ -218,7 +224,18 @@ function splitShellCommands(command: string): ShellSegment[] {
   }
 
   const tail = command.slice(start).trim();
-  if (tail) result.push({ segment: tail, separator, cwdUnsafe });
+  const hasSubstitution = substitutionStarts.some(
+    (offset) => offset >= start && offset < command.length,
+  );
+  if (tail || hasSubstitution) {
+    result.push({
+      segment: tail,
+      separator,
+      cwdUnsafe,
+      startOffset: start,
+      endOffset: command.length,
+    });
+  }
   return result;
 }
 
@@ -506,10 +523,13 @@ function commandAndArgs(segment: string): { name: string; args: string[] } | und
   return undefined;
 }
 
-function findExecCommands(args: string[]): string[][] {
-  const commands: string[][] = [];
+function findExecCommands(
+  args: string[],
+): Array<{ args: string[]; cwdUnknown: boolean }> {
+  const commands: Array<{ args: string[]; cwdUnknown: boolean }> = [];
   for (let index = 0; index < args.length; index++) {
-    if (!["-exec", "-execdir", "-ok", "-okdir"].includes(args[index])) continue;
+    const option = args[index];
+    if (!["-exec", "-execdir", "-ok", "-okdir"].includes(option)) continue;
     const start = index + 1;
     let end = start;
     while (
@@ -520,7 +540,12 @@ function findExecCommands(args: string[]): string[][] {
     ) {
       end++;
     }
-    if (end > start) commands.push(args.slice(start, end));
+    if (end > start) {
+      commands.push({
+        args: args.slice(start, end),
+        cwdUnknown: option === "-execdir" || option === "-okdir",
+      });
+    }
     index = end;
   }
   return commands;
@@ -528,6 +553,52 @@ function findExecCommands(args: string[]): string[][] {
 
 function quoteShellArgument(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+/** Commands that can redirect later filesystem operations through aliases. */
+function createsFilesystemAlias(name: string, args: string[]): boolean {
+  if (["sudo", "doas", "pkexec"].includes(name)) {
+    const valueOptions = [
+      "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+      "-C", "--close-from", "-T", "--command-timeout", "-r", "--role",
+      "-t", "--type", "-D", "--chdir", "-R", "--chroot",
+    ];
+    let index = 0;
+    while (index < args.length) {
+      const option = args[index];
+      if (option === "--") {
+        index++;
+        break;
+      }
+      if (!option.startsWith("-")) break;
+      index += valueOptions.includes(option) ? 2 : 1;
+    }
+    const nested = commandAndArgs(args.slice(index).map(quoteShellArgument).join(" "));
+    return nested ? createsFilesystemAlias(nested.name, nested.args) : false;
+  }
+
+  if (name === "ln") {
+    for (const arg of args) {
+      if (arg === "--") break;
+      if (arg === "--symbolic" || /^-[^-]*s/.test(arg)) return true;
+    }
+  }
+
+  if (name === "mount") {
+    const bindOption = /(?:^|,)r?bind(?:,|$)/i;
+    for (let index = 0; index < args.length; index++) {
+      const arg = args[index];
+      if (arg === "--bind" || arg === "--rbind" || arg === "-B" || arg === "-R") return true;
+      if (arg === "-o" && bindOption.test(args[index + 1] ?? "")) return true;
+      if (/^-o.+/.test(arg) && bindOption.test(arg.slice(2))) return true;
+    }
+  }
+
+  return false;
+}
+
+function segmentCreatesFilesystemAlias(segment: string): boolean {
+  const invocation = commandAndArgs(segment);
+  return invocation ? createsFilesystemAlias(invocation.name, invocation.args) : false;
 }
 
 function hasRecursiveForceFlags(args: string[]): boolean {
@@ -836,7 +907,7 @@ function deletesOnlyEphemeralSubdirectories(
 
 /**
  * True when every recursive-delete target is a strict descendant of the
- * session root. The root itself and any unresolved expansion stay critical.
+ * session root. Broad roots cannot grant a workspace exemption.
  */
 function deletesOnlyWithinSession(
   targets: string[],
@@ -845,7 +916,7 @@ function deletesOnlyWithinSession(
 ): boolean {
   if (targets.length === 0 || !sessionRoot) return false;
   const rootCandidates = resolveFilesystemPathCandidates(sessionRoot, sessionRoot);
-  if (rootCandidates.length === 0) return false;
+  if (rootCandidates.length === 0 || !isSafeSessionRoot(rootCandidates)) return false;
   return targets.every((target) => {
     if (SHELL_EXPANSION.test(target)) return false;
     if (cwd === undefined && !path.isAbsolute(target) && !target.startsWith("~")) return false;
@@ -870,6 +941,64 @@ function targetsHomeRoot(target: string): boolean {
     target === "$HOME/*" ||
     target === `${home}/*`
   );
+}
+const SYSTEM_PATH_ROOTS = [
+  "/etc",
+  "/usr",
+  "/bin",
+  "/sbin",
+  "/boot",
+  "/dev",
+  "/proc",
+  "/sys",
+  "/var",
+  "/root",
+  "/Library",
+  "/System",
+  "/Applications",
+  "/private",
+];
+const USER_DIRECTORY_ROOTS = ["/home", "/Users"];
+
+function targetsSystemPath(target: string, cwd: string | undefined): boolean {
+  const homeExpansion = target === "~" || target.startsWith("~/");
+  if (cwd === undefined && !path.isAbsolute(target) && !homeExpansion) return true;
+  const candidates = resolveFilesystemPathCandidates(target, cwd ?? path.sep);
+  const home = process.env.HOME || os.homedir();
+  const homeCandidates = resolveFilesystemPathCandidates(home, home);
+  return candidates.some((candidate) =>
+    candidate === path.sep ||
+    USER_DIRECTORY_ROOTS.some((root) =>
+      candidate === root ||
+      (isWithinDirectory(candidate, root) &&
+        !homeCandidates.some((homePath) => isWithinDirectory(candidate, homePath))),
+    ) ||
+    SYSTEM_PATH_ROOTS.some((root) =>
+      candidate === root || isWithinDirectory(candidate, root),
+    ),
+  );
+}
+
+function isSafeSessionRoot(rootCandidates: string[]): boolean {
+  const home = process.env.HOME || os.homedir();
+  const homeCandidates = resolveFilesystemPathCandidates(home, home);
+  return rootCandidates.every((root) => {
+    if (
+      root === path.sep ||
+      homeCandidates.some((candidate) =>
+        candidate === root || isWithinDirectory(candidate, root),
+      )
+    ) {
+      return false;
+    }
+    const insideHome = homeCandidates.some((candidate) => isWithinDirectory(root, candidate));
+    if (insideHome) return true;
+    return ![...SYSTEM_PATH_ROOTS, ...USER_DIRECTORY_ROOTS].some((protectedRoot) =>
+      root === protectedRoot ||
+      isWithinDirectory(root, protectedRoot) ||
+      isWithinDirectory(protectedRoot, root),
+    );
+  });
 }
 
 
@@ -1176,6 +1305,7 @@ const MANDATORY_REVIEW_BEHAVIORS: Record<string, true> = {
   "permission-change-system": true,
   "dd-write": true,
   "sensitive-working-directory": true,
+  "analysis-limit-exceeded": true,
 };
 
 /** Deny-tier behaviors: regex-confident enough to block without an LLM
@@ -1205,36 +1335,56 @@ export function analyzeCommand(
   sessionRoot = cwd,
 ): DangerAnalysis {
   const behaviorSet = new Set<string>();
-  const pending = [String(cmd ?? "")];
+  const pending: Array<{ command: string; cwd: string | undefined }> = [
+    { command: String(cmd ?? ""), cwd },
+  ];
+  const recursiveDeletes: Array<{
+    segment: string;
+    targets: string[];
+    cwd: string | undefined;
+  }> = [];
+  let aliasSeen = false;
   let pendingBudget = 64;
 
   while (pending.length > 0 && pendingBudget > 0) {
     pendingBudget--;
-    const command = normalize(pending.pop() ?? "");
+    const pendingCommand = pending.pop();
+    if (!pendingCommand) break;
+    const command = normalize(pendingCommand.command);
     const substitutions = findShellSubstitutions(command);
-    for (const substitution of substitutions) pending.push(substitution.body);
 
     const executableCommand = stripShellSubstitutions(command, substitutions);
     const syntax = stripQuotedShellData(executableCommand);
-    const segments = splitShellCommands(executableCommand);
-    let segmentCwd: string | undefined = cwd;
+    const segments = splitShellCommands(
+      executableCommand,
+      substitutions.map(({ start }) => start),
+    );
+    let segmentCwd: string | undefined = pendingCommand.cwd;
 
-    for (const { segment, cwdUnsafe } of segments) {
+    for (const { segment, cwdUnsafe, startOffset, endOffset } of segments) {
+      if (segmentCreatesFilesystemAlias(segment)) aliasSeen = true;
       // A cwd established by an earlier `cd` survives `&&`, `;`, and newline
       // only. Pipes, background jobs, `||`, and subshells make it unverifiable.
       if (cwdUnsafe) {
         segmentCwd = undefined;
       }
+      for (const substitution of substitutions) {
+        if (substitution.start >= startOffset && substitution.start < endOffset) {
+          pending.push({ command: substitution.body, cwd: segmentCwd });
+        }
+      }
       const invocation = commandAndArgs(segment);
       if (!invocation) continue;
       const { name, args } = invocation;
-
       if (name === "git") {
         for (const behavior of analyzeGit(args)) behaviorSet.add(behavior);
       }
       if (name === "find") {
-        for (const commandArgs of findExecCommands(args)) {
-          pending.push(commandArgs.map(quoteShellArgument).join(" "));
+        for (const { args: commandArgs, cwdUnknown } of findExecCommands(args)) {
+          pending.push({
+            command: commandArgs.map(quoteShellArgument).join(" "),
+            cwd: cwdUnknown ? undefined : segmentCwd,
+          });
         }
       }
       if (isGlobalPackageUninstall(name, args)) behaviorSet.add("pkg-global-uninstall");
@@ -1249,38 +1399,27 @@ export function analyzeCommand(
       }
       if (SHELL_INTERPRETERS[name] === true) {
         const script = shellInlineScript(args);
-        if (script) pending.push(script);
+        if (script) pending.push({ command: script, cwd: segmentCwd });
       }
       if (name === "eval" && args.length > 0) {
-        pending.push(args.join(" "));
+        pending.push({ command: args.join(" "), cwd: segmentCwd });
       }
       const positional = args.filter((arg) => arg !== "--" && !arg.startsWith("-"));
       if (name === "chmod" || name === "chown") {
         behaviorSet.add("permission-change");
-        if (
-          positional.some((target) =>
-            /^\/(?:etc|usr|bin|sbin|boot|dev|proc|sys|var|root|home|Library)(?:\/|$)/i.test(target),
-          )
-        ) {
+        if (positional.some((target) => targetsSystemPath(target, segmentCwd))) {
           behaviorSet.add("permission-change-system");
         }
       }
       const destination = positional[positional.length - 1];
       const recursiveForce = name === "rm" && hasRecursiveForceFlags(args);
-      const ephemeralOnly = recursiveForce &&
-        deletesOnlyEphemeralSubdirectories(positional, segmentCwd);
-      const workspaceOnly = recursiveForce &&
-        deletesOnlyWithinSession(positional, segmentCwd, sessionRoot);
-      // rmdir stays governed by the analyzer's own root check; VS Code's
-      // blanket rmdir deny would otherwise re-flag every ordinary rmdir.
-      if (!ephemeralOnly && name !== "rmdir") {
+      if (recursiveForce) {
+        recursiveDeletes.push({ segment, targets: positional, cwd: segmentCwd });
+      } else if (name !== "rmdir") {
+        // rmdir stays governed by the analyzer's own root check; VS Code's
+        // blanket rmdir deny would otherwise re-flag every ordinary rmdir.
         const autoApprove = evaluateAutoApprove(segment, AUTO_APPROVE_RULES);
         if (autoApprove.result === "denied") behaviorSet.add("auto-approve-denied");
-      }
-      if (recursiveForce && !ephemeralOnly) {
-        behaviorSet.add(
-          workspaceOnly ? "recursive-force-delete-workspace" : "recursive-force-delete",
-        );
       }
       if (name === "rm" && positional.includes("/")) behaviorSet.add("delete-root");
       if (
@@ -1330,11 +1469,7 @@ export function analyzeCommand(
           /^\/etc\/(?:passwd|shadow|sudoers|hosts)$/i.test(destination));
       if (writesSensitiveFile) behaviorSet.add("write-sensitive-file");
       const ddTarget = args.find((arg) => /^of=/.test(arg))?.slice(3);
-      if (
-        ddTarget &&
-        (/^\/dev\//i.test(ddTarget) ||
-          /^\/(?:etc|usr|bin|sbin|boot|proc|sys|var|root|System|Library)(?:\/|$)/i.test(ddTarget))
-      ) {
+      if (ddTarget && targetsSystemPath(ddTarget, segmentCwd)) {
         behaviorSet.add("dd-write");
       }
       if (name === "mkfs" || name.startsWith("mkfs.")) behaviorSet.add("disk-format");
@@ -1393,6 +1528,20 @@ export function analyzeCommand(
       behaviorSet.add("remote-fetch-exec");
     }
   }
+  for (const deletion of recursiveDeletes) {
+    const ephemeralOnly = !aliasSeen &&
+      deletesOnlyEphemeralSubdirectories(deletion.targets, deletion.cwd);
+    if (ephemeralOnly) continue;
+    const workspaceOnly = !aliasSeen &&
+      deletesOnlyWithinSession(deletion.targets, deletion.cwd, sessionRoot);
+    const autoApprove = evaluateAutoApprove(deletion.segment, AUTO_APPROVE_RULES);
+    if (autoApprove.result === "denied") behaviorSet.add("auto-approve-denied");
+    behaviorSet.add(
+      workspaceOnly ? "recursive-force-delete-workspace" : "recursive-force-delete",
+    );
+  }
+  if (pending.length > 0) behaviorSet.add("analysis-limit-exceeded");
+
 
   const behaviors = [...behaviorSet];
   const labels = behaviors.map((behavior) => BEHAVIORS[behavior] || makeLabel(behavior, behavior));

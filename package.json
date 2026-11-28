@@ -3,7 +3,8 @@
   "description": "High-risk-only approval hook with LLM risk analysis, behavior detection, protected-path interception, and decision memory for oh-my-pi (OMP) and pi-agent.",
   "version": "2.9.0",
   "files": [
-    "dist"
+    "dist",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "keywords": [
     "omp",
